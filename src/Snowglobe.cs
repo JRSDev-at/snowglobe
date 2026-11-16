@@ -1,7 +1,7 @@
 // Snowglobe – leichter Schneefall für den Windows-Desktop.
 // Ein transparentes, durchklickbares Overlay pro Monitor. Schnee bleibt auf
 // Fensteroberkanten, Desktop-Icons und am Bildschirmboden liegen. Dazu eine
-// Schaufel und ein Schneeroboter zum Räumen.
+// Schaufel, ein Schneeroboter und automatische Updates über GitHub-Releases.
 // Build: build.cmd (nutzt den in Windows enthaltenen C#-Compiler, kein SDK nötig)
 
 using System;
@@ -12,15 +12,19 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Net;
+using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
+using System.Web.Script.Serialization;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
-[assembly: System.Reflection.AssemblyTitle("Snowglobe")]
-[assembly: System.Reflection.AssemblyProduct("Snowglobe")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyTitle("Snowglobe")]
+[assembly: AssemblyProduct("Snowglobe")]
+[assembly: AssemblyVersion("1.2.0.0")]
 
 namespace Snowglobe
 {
@@ -50,7 +54,9 @@ namespace Snowglobe
         [DllImport("gdi32.dll")] public static extern IntPtr SelectObject(IntPtr dc, IntPtr o);
         [DllImport("gdi32.dll")] public static extern bool DeleteObject(IntPtr o);
         [DllImport("gdi32.dll")] public static extern IntPtr CreateDIBSection(IntPtr dc, ref BITMAPINFOHEADER bmi, uint usage, out IntPtr bits, IntPtr sec, uint off);
+        [DllImport("gdi32.dll")] public static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, uint rop);
         [DllImport("user32.dll")] public static extern bool UpdateLayeredWindow(IntPtr h, IntPtr dst, ref POINT pt, ref SIZE sz, IntPtr src, ref POINT ptSrc, int key, ref BLENDFUNCTION bf, int flags);
+        [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
         [DllImport("user32.dll")] public static extern bool GetLayeredWindowAttributes(IntPtr h, out uint key, out byte alpha, out uint flags);
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint f);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
@@ -104,16 +110,132 @@ namespace Snowglobe
         }
     }
 
+    // ------------------------------------------------------------ GPU-Ausgabe (Direct3D 11 + DirectComposition)
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct DXGI_SWAP_CHAIN_DESC1
+    {
+        public uint Width, Height; public int Format, Stereo; public uint SampleCount, SampleQuality, BufferUsage, BufferCount;
+        public int Scaling, SwapEffect, AlphaMode; public uint Flags;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct D3D11_BOX { public uint Left, Top, Front, Right, Bottom, Back; }
+    [StructLayout(LayoutKind.Sequential)]
+    struct D3D11_TEXTURE2D_DESC
+    {
+        public uint Width, Height, MipLevels, ArraySize; public int Format; public uint SampleCount, SampleQuality;
+        public int Usage; public uint BindFlags, CPUAccessFlags, MiscFlags;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct D3D11_MAPPED_SUBRESOURCE { public IntPtr pData; public uint RowPitch, DepthPitch; }
+
+    // Gemeinsame D3D11-/DComp-Geräte; Aufrufe direkt über die COM-vtables.
+    static class Gpu
+    {
+        [DllImport("d3d11.dll")] static extern int D3D11CreateDevice(IntPtr adapter, int driverType, IntPtr software, uint flags, IntPtr levels, uint numLevels, uint sdk, out IntPtr device, out int level, out IntPtr context);
+        [DllImport("dcomp.dll")] static extern int DCompositionCreateDevice(IntPtr dxgiDevice, ref Guid iid, out IntPtr dev);
+
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int GetAdapterFn(IntPtr self, out IntPtr adapter);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int GetParentFn(IntPtr self, ref Guid iid, out IntPtr parent);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int CreateSwapChainFn(IntPtr self, IntPtr device, ref DXGI_SWAP_CHAIN_DESC1 desc, IntPtr restrict, out IntPtr sc);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int PresentFn(IntPtr self, uint sync, uint flags);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int GetBufferFn(IntPtr self, uint idx, ref Guid iid, out IntPtr surface);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void UpdateSubresourceFn(IntPtr self, IntPtr res, uint sub, ref D3D11_BOX box, IntPtr src, uint rowPitch, uint depthPitch);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int CreateTexture2DFn(IntPtr self, ref D3D11_TEXTURE2D_DESC desc, IntPtr init, out IntPtr tex);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int MapFn(IntPtr self, IntPtr res, uint sub, int type, uint flags, out D3D11_MAPPED_SUBRESOURCE m);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void UnmapFn(IntPtr self, IntPtr res, uint sub);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate void CopyResourceFn(IntPtr self, IntPtr dst, IntPtr src);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int CommitFn(IntPtr self);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int CreateTargetFn(IntPtr self, IntPtr hwnd, int topmost, out IntPtr target);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int CreateVisualFn(IntPtr self, out IntPtr visual);
+        [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate int SetPtrFn(IntPtr self, IntPtr p);
+
+        public static IntPtr Device, Context, DComp, Factory;
+        public static UpdateSubresourceFn UpdateSubresource;
+        public static CreateTexture2DFn CreateTexture2D;
+        public static MapFn Map;
+        public static UnmapFn Unmap;
+        public static CopyResourceFn CopyResource;
+        public static PresentFn Present;
+        public static GetBufferFn GetBuffer;
+        public static CommitFn Commit;
+        static bool tried;
+        public static bool Ok;
+
+        public static Guid IID_Texture2D = new Guid("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
+
+        public static T Fn<T>(IntPtr obj, int slot) where T : class
+        {
+            IntPtr vtbl = Marshal.ReadIntPtr(obj);
+            return (T)(object)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(vtbl, slot * IntPtr.Size), typeof(T));
+        }
+
+        public static bool Init()
+        {
+            if (tried) return Ok;
+            tried = true;
+            if (Program.NoGpu) return false;
+            try
+            {
+                IntPtr dev, ctx; int lvl;
+                if (D3D11CreateDevice(IntPtr.Zero, 1, IntPtr.Zero, 0x20, IntPtr.Zero, 0, 7, out dev, out lvl, out ctx) < 0) return false;
+                Device = dev; Context = ctx;
+                Guid iidDxgiDevice = new Guid("54ec77fa-1377-44e6-8c32-88fd5f44c84c");
+                IntPtr dxgiDev;
+                if (Marshal.QueryInterface(dev, ref iidDxgiDevice, out dxgiDev) < 0) return false;
+                IntPtr adapter;
+                if (Fn<GetAdapterFn>(dxgiDev, 7)(dxgiDev, out adapter) < 0) return false;
+                Guid iidFactory2 = new Guid("50c83a1c-e072-4c48-87b0-3630fa36a6d0");
+                IntPtr factory;
+                int hr = Fn<GetParentFn>(adapter, 6)(adapter, ref iidFactory2, out factory);
+                Marshal.Release(adapter);
+                if (hr < 0) return false;
+                Factory = factory;
+                Guid iidDComp = new Guid("C37EA93A-E7AA-450D-B16F-9746CB0407F3");
+                IntPtr dcomp;
+                hr = DCompositionCreateDevice(dxgiDev, ref iidDComp, out dcomp);
+                Marshal.Release(dxgiDev);
+                if (hr < 0) return false;
+                DComp = dcomp;
+                UpdateSubresource = Fn<UpdateSubresourceFn>(ctx, 48);
+                CreateTexture2D = Fn<CreateTexture2DFn>(dev, 5);
+                Map = Fn<MapFn>(ctx, 14);
+                Unmap = Fn<UnmapFn>(ctx, 15);
+                CopyResource = Fn<CopyResourceFn>(ctx, 47);
+                Commit = Fn<CommitFn>(dcomp, 3);
+                Ok = true;
+            }
+            catch { Ok = false; }
+            return Ok;
+        }
+    }
+
     // ------------------------------------------------------------ Overlay
 
     // Transparentes, durchklickbares Fenster mit eigenem 32-bit-Puffer (premultiplied ARGB).
+    // Ausgabe bevorzugt über die GPU (nur geänderte Kacheln werden hochgeladen), sonst per UpdateLayeredWindow.
     unsafe sealed class Overlay : NativeWindow, IDisposable
     {
         public readonly int X, Y, W, H;
         public readonly uint* Bits;
-        IntPtr memDC, dib, oldObj;
+        public readonly bool OnGpu;
+        IntPtr memDC, dib, oldObj, mem;
+        IntPtr swap, target, visual;
+        int fullFrames = 2;
+        public int LastTiles;
+        public int TotalTiles { get { return W * H; } }
 
-        public Overlay(Rectangle b)
+        public static Overlay Create(Rectangle b)
+        {
+            if (Gpu.Init())
+            {
+                Overlay o = null;
+                try { o = new Overlay(b, true); if (o.OnGpu) return o; }
+                catch { }
+                if (o != null) o.Dispose();
+            }
+            return new Overlay(b, false);
+        }
+
+        Overlay(Rectangle b, bool gpu)
         {
             X = b.X; Y = b.Y; W = b.Width; H = b.Height;
             var cp = new CreateParams();
@@ -122,8 +244,18 @@ namespace Snowglobe
             cp.Style = unchecked((int)0x80000000);                 // WS_POPUP
             cp.ExStyle = 0x00080000 | 0x00000020 | 0x00000080      // LAYERED | TRANSPARENT | TOOLWINDOW
                        | 0x00000008 | 0x08000000;                  // TOPMOST | NOACTIVATE
+            if (gpu) cp.ExStyle |= 0x00200000;                     // NOREDIRECTIONBITMAP
             CreateHandle(cp);
 
+            if (gpu)
+            {
+                N.SetLayeredWindowAttributes(Handle, 0, 255, 2);
+                mem = Marshal.AllocHGlobal(new IntPtr((long)W * H * 4));
+                Bits = (uint*)mem;
+                Clear();
+                OnGpu = InitSwapChain();
+                return;
+            }
             var bi = new BITMAPINFOHEADER();
             bi.biSize = 40; bi.biWidth = W; bi.biHeight = -H; bi.biPlanes = 1; bi.biBitCount = 32;
             IntPtr screen = N.GetDC(IntPtr.Zero);
@@ -135,24 +267,127 @@ namespace Snowglobe
             Bits = (uint*)bits;
         }
 
+        bool InitSwapChain()
+        {
+            var d = new DXGI_SWAP_CHAIN_DESC1();
+            d.Width = (uint)W; d.Height = (uint)H; d.Format = 87;     // B8G8R8A8_UNORM
+            d.SampleCount = 1; d.BufferUsage = 0x20; d.BufferCount = 2;
+            d.Scaling = 0; d.SwapEffect = 3; d.AlphaMode = 1;          // STRETCH, FLIP_SEQUENTIAL, PREMULTIPLIED
+            if (Gpu.Fn<Gpu.CreateSwapChainFn>(Gpu.Factory, 24)(Gpu.Factory, Gpu.Device, ref d, IntPtr.Zero, out swap) < 0) return false;
+            if (Gpu.Present == null) { Gpu.Present = Gpu.Fn<Gpu.PresentFn>(swap, 8); Gpu.GetBuffer = Gpu.Fn<Gpu.GetBufferFn>(swap, 9); }
+            if (Gpu.Fn<Gpu.CreateTargetFn>(Gpu.DComp, 6)(Gpu.DComp, Handle, 1, out target) < 0) return false;
+            if (Gpu.Fn<Gpu.CreateVisualFn>(Gpu.DComp, 7)(Gpu.DComp, out visual) < 0) return false;
+            if (Gpu.Fn<Gpu.SetPtrFn>(visual, 15)(visual, swap) < 0) return false;    // SetContent
+            if (Gpu.Fn<Gpu.SetPtrFn>(target, 3)(target, visual) < 0) return false;   // SetRoot
+            if (!InitStaging()) return false;
+            return Gpu.Commit(Gpu.DComp) >= 0;
+        }
+
         public void SetExcludeFromCapture(bool on)
         {
             N.SetWindowDisplayAffinity(Handle, on ? 0x11u : 0u);
         }
 
-        public void Present()
+        // Ring aus CPU-beschreibbaren Staging-Texturen: pro Frame werden nur die geänderten Rechtecke
+        // hineinkopiert (memcpy), die GPU kopiert die Textur dann selbst in den Ausgabepuffer.
+        const int Ring = 3;
+        readonly IntPtr[] staging = new IntPtr[Ring];
+        readonly int[] stagingFull = new int[Ring];
+        readonly List<Rectangle>[] hist = new List<Rectangle>[Ring + 1];
+        int ringPos;
+
+        bool InitStaging()
         {
-            POINT dst = new POINT(); dst.X = X; dst.Y = Y;
-            SIZE sz = new SIZE(); sz.cx = W; sz.cy = H;
-            POINT src = new POINT();
-            BLENDFUNCTION bf = new BLENDFUNCTION(); bf.SourceConstantAlpha = 255; bf.AlphaFormat = 1;
-            N.UpdateLayeredWindow(Handle, IntPtr.Zero, ref dst, ref sz, memDC, ref src, 0, ref bf, 2);
+            var d = new D3D11_TEXTURE2D_DESC();
+            d.Width = (uint)W; d.Height = (uint)H; d.MipLevels = 1; d.ArraySize = 1; d.Format = 87;
+            d.SampleCount = 1; d.Usage = 3; d.CPUAccessFlags = 0x10000;   // STAGING, CPU_ACCESS_WRITE
+            for (int i = 0; i < Ring; i++)
+            {
+                if (Gpu.CreateTexture2D(Gpu.Device, ref d, IntPtr.Zero, out staging[i]) < 0) return false;
+                stagingFull[i] = 1;
+            }
+            for (int i = 0; i < hist.Length; i++) hist[i] = new List<Rectangle>(1024);
+            return true;
         }
+
+        // drawn = in diesem Frame gezeichnete Rechtecke (alte Positionen wurden in diesem Frame gelöscht
+        // und stehen im vorigen Eintrag). Eine Staging-Textur ist Ring Frames alt.
+        public void Present(List<Rectangle> drawn)
+        {
+            if (!OnGpu)
+            {
+                POINT dst = new POINT(); dst.X = X; dst.Y = Y;
+                SIZE sz = new SIZE(); sz.cx = W; sz.cy = H;
+                POINT src = new POINT();
+                BLENDFUNCTION bf = new BLENDFUNCTION(); bf.SourceConstantAlpha = 255; bf.AlphaFormat = 1;
+                N.UpdateLayeredWindow(Handle, IntPtr.Zero, ref dst, ref sz, memDC, ref src, 0, ref bf, 2);
+                return;
+            }
+            if (fullFrames > 0) { fullFrames--; for (int i = 0; i < Ring; i++) stagingFull[i] = 1; }
+            // Verlauf schieben: hist[0] = dieser Frame, hist[k] = vor k Frames
+            var last = hist[hist.Length - 1];
+            for (int i = hist.Length - 1; i > 0; i--) hist[i] = hist[i - 1];
+            hist[0] = last; last.Clear(); last.AddRange(drawn);
+
+            long q0 = Stopwatch.GetTimestamp();
+            IntPtr st = staging[ringPos];
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (Gpu.Map(Gpu.Context, st, 0, 2, 0, out m) < 0) return;   // D3D11_MAP_WRITE
+            long q1 = Stopwatch.GetTimestamp();
+            byte* dstBase = (byte*)m.pData;
+            int pitch = (int)m.RowPitch, tiles = 0;
+            if (stagingFull[ringPos] != 0)
+            {
+                stagingFull[ringPos] = 0;
+                for (int y = 0; y < H; y++) CopyRow(dstBase + (long)y * pitch, Bits + (long)y * W, W);
+                tiles = W * H;
+            }
+            else
+            {
+                for (int k = 0; k < hist.Length; k++)
+                {
+                    var list = hist[k];
+                    for (int i = 0; i < list.Count; i++)
+                    {
+                        Rectangle r = list[i];
+                        int x0 = Math.Max(0, r.X), y0 = Math.Max(0, r.Y), x1 = Math.Min(W, r.Right), y1 = Math.Min(H, r.Bottom);
+                        if (x1 <= x0 || y1 <= y0) continue;
+                        int n = x1 - x0;
+                        for (int y = y0; y < y1; y++) CopyRow(dstBase + (long)y * pitch + x0 * 4, Bits + (long)y * W + x0, n);
+                        tiles += n * (y1 - y0);
+                    }
+                }
+            }
+            Gpu.Unmap(Gpu.Context, st, 0);
+            LastTiles = tiles;
+            IntPtr tex;
+            if (Gpu.GetBuffer(swap, 0, ref Gpu.IID_Texture2D, out tex) >= 0)
+            {
+                Gpu.CopyResource(Gpu.Context, tex, st);
+                Marshal.Release(tex);
+            }
+            ringPos = (ringPos + 1) % Ring;
+            long q2 = Stopwatch.GetTimestamp();
+            Gpu.Present(swap, 0, 0);
+            long q3 = Stopwatch.GetTimestamp();
+            TGet += q1 - q0; TUpload += q2 - q1; TPresent += q3 - q2;
+        }
+
+        static void CopyRow(byte* dst, uint* src, int n)
+        {
+            ulong* d = (ulong*)dst, s = (ulong*)src;
+            int pairs = n >> 1;
+            for (int i = 0; i < pairs; i++) d[i] = s[i];
+            if ((n & 1) != 0) ((uint*)dst)[n - 1] = src[n - 1];
+        }
+
+        public static long TGet, TUpload, TPresent;
 
         public void Clear()
         {
             long n = (long)W * H;
             for (long i = 0; i < n; i++) Bits[i] = 0;
+            fullFrames = 2;
         }
 
         public void SetShown(bool shown)
@@ -192,7 +427,85 @@ namespace Snowglobe
                 N.DeleteDC(memDC);
                 memDC = IntPtr.Zero;
             }
+            if (visual != IntPtr.Zero) { Marshal.Release(visual); visual = IntPtr.Zero; }
+            if (target != IntPtr.Zero) { Marshal.Release(target); target = IntPtr.Zero; }
+            if (swap != IntPtr.Zero) { Marshal.Release(swap); swap = IntPtr.Zero; }
+            for (int i = 0; i < Ring; i++) if (staging[i] != IntPtr.Zero) { Marshal.Release(staging[i]); staging[i] = IntPtr.Zero; }
+            if (Gpu.Ok) Gpu.Commit(Gpu.DComp);
             DestroyHandle();
+            if (mem != IntPtr.Zero) { Marshal.FreeHGlobal(mem); mem = IntPtr.Zero; }
+        }
+    }
+
+    // ------------------------------------------------------------ Bildschirm-Probe
+
+    // Liest einen schmalen Streifen vom Bildschirm (ohne Layered-Fenster, also ohne den eigenen Schnee),
+    // um die tatsächlich sichtbare Kante von Popups mit transparentem Rand zu finden.
+    unsafe static class ScreenProbe
+    {
+        static int[] Grab(int x, int y, int w, int h)
+        {
+            var res = new int[w * h];
+            IntPtr screen = N.GetDC(IntPtr.Zero);
+            IntPtr dc = N.CreateCompatibleDC(screen);
+            var bi = new BITMAPINFOHEADER();
+            bi.biSize = 40; bi.biWidth = w; bi.biHeight = -h; bi.biPlanes = 1; bi.biBitCount = 32;
+            IntPtr bits;
+            IntPtr dib = N.CreateDIBSection(screen, ref bi, 0, out bits, IntPtr.Zero, 0);
+            IntPtr old = N.SelectObject(dc, dib);
+            N.BitBlt(dc, 0, 0, w, h, screen, x, y, 0x00CC0020); // SRCCOPY ohne CAPTUREBLT
+            Marshal.Copy(bits, res, 0, w * h);
+            N.SelectObject(dc, old);
+            N.DeleteObject(dib);
+            N.DeleteDC(dc);
+            N.ReleaseDC(IntPtr.Zero, screen);
+            return res;
+        }
+
+        static int Diff(int a, int b)
+        {
+            return Math.Abs(((a >> 16) & 255) - ((b >> 16) & 255)) + Math.Abs(((a >> 8) & 255) - ((b >> 8) & 255)) + Math.Abs((a & 255) - (b & 255));
+        }
+
+        // erste deutliche, danach stabile Farbkante ab Index 'pre' (= Rechteckkante); Ergebnis relativ dazu
+        static int Edge(int[] c, int pre)
+        {
+            for (int i = 1; i < c.Length - 4; i++)
+            {
+                if (Diff(c[i], c[i - 1]) < 30) continue;
+                if (Diff(c[i], c[i + 1]) > 20 || Diff(c[i], c[i + 2]) > 24 || Diff(c[i], c[i + 3]) > 28) continue;
+                return Math.Max(0, i - pre);
+            }
+            return 0;
+        }
+
+        // Einrückung (links, oben, rechts) der sichtbaren Fläche gegenüber dem Fensterrechteck.
+        public static int[] Inset(RECT r)
+        {
+            var res = new int[3];
+            int w = r.Right - r.Left, h = r.Bottom - r.Top;
+            if (w < 40 || h < 30) return res;
+            const int pre = 3, len = 36;
+            try
+            {
+                var tops = new List<int>();
+                for (int k = 1; k <= 3; k++)
+                {
+                    int x = r.Left + w * k / 4;
+                    var c = Grab(x, r.Top - pre, 1, len + pre);
+                    tops.Add(Edge(c, pre));
+                }
+                tops.Sort();
+                res[1] = tops[1];
+                int row = r.Top + res[1] + Math.Min(12, h / 3);
+                var l = Grab(r.Left - pre, row, len + pre, 1);
+                res[0] = Edge(l, pre);
+                var rr = Grab(r.Right - len, row, len + pre, 1);
+                Array.Reverse(rr);
+                res[2] = Edge(rr, pre);
+            }
+            catch { }
+            return res;
         }
     }
 
@@ -209,6 +522,7 @@ namespace Snowglobe
 
         public static void Build()
         {
+            if (Data != null) return;
             Data = new uint[Classes * 16][];
             Size = new int[Classes];
             Off = new int[Classes];
@@ -263,7 +577,7 @@ namespace Snowglobe
         }
     }
 
-    // ------------------------------------------------------------ Art (Roboter, Schaufel)
+    // ------------------------------------------------------------ Art (Roboter, Schaufel, Röhre)
 
     // Mit GDI+ gezeichnete Grafik als premultiplied-Pixel; (AX, AY) ist der Ankerpunkt.
     sealed class Art
@@ -396,7 +710,6 @@ namespace Snowglobe
                 float hb = h - 0.5f;
                 res[dir] = Build(w, h, ax, h, dir == 1, delegate (Graphics g)
                 {
-                    // Stiel
                     using (var pen = new Pen(Color.FromArgb(255, 150, 98, 52), 2.8f * u))
                     {
                         pen.StartCap = pen.EndCap = LineCap.Round;
@@ -404,7 +717,6 @@ namespace Snowglobe
                     }
                     using (var pen = new Pen(Color.FromArgb(255, 196, 140, 84), 1f * u))
                         g.DrawLine(pen, 17.4f * u, hb - 5 * u, 5.6f * u, hb - 35 * u);
-                    // D-Griff
                     using (var pen = new Pen(Color.FromArgb(255, 40, 40, 46), 1.8f * u))
                     {
                         g.DrawLine(pen, 2 * u, hb - 37 * u, 10 * u, hb - 37 * u);
@@ -412,12 +724,93 @@ namespace Snowglobe
                         g.DrawLine(pen, 10 * u, hb - 37 * u, 8 * u, hb - 42 * u);
                         g.DrawLine(pen, 4 * u, hb - 42 * u, 8 * u, hb - 42 * u);
                     }
-                    // Blatt (Boden + Stirnwand)
                     var pan = new PointF[] { new PointF(11 * u, hb - 2.4f * u), new PointF(32 * u, hb - 2.4f * u), new PointF(33 * u, hb), new PointF(12 * u, hb) };
                     var wall = new PointF[] { new PointF(29.5f * u, hb - 13 * u), new PointF(33 * u, hb - 14.5f * u), new PointF(34 * u, hb), new PointF(31 * u, hb) };
                     using (var b = new SolidBrush(Color.FromArgb(255, 70, 132, 210))) { g.FillPolygon(b, pan); g.FillPolygon(b, wall); }
                     using (var pen = new Pen(Color.FromArgb(255, 30, 70, 130), 0.8f * u)) { g.DrawPolygon(pen, pan); g.DrawPolygon(pen, wall); }
                     using (var pen = new Pen(Color.FromArgb(255, 200, 206, 216), 1.2f * u)) g.DrawLine(pen, 31.2f * u, hb - 0.4f * u, 33.6f * u, hb - 0.4f * u);
+                });
+            }
+            return res;
+        }
+
+        // Geparkte Schaufel: steckt aufrecht im Schnee. Anker = Blattunterkante.
+        public static Art ShovelStand(float u)
+        {
+            int w = (int)Math.Ceiling(20 * u), h = (int)Math.Ceiling(50 * u);
+            return Build(w, h, w / 2, h, false, delegate (Graphics g)
+            {
+                float c = w / 2f, hb = h - 0.5f;
+                using (var pen = new Pen(Color.FromArgb(255, 150, 98, 52), 2.8f * u))
+                {
+                    pen.StartCap = pen.EndCap = LineCap.Round;
+                    g.DrawLine(pen, c, hb - 14 * u, c + 1.5f * u, hb - 42 * u);
+                }
+                using (var pen = new Pen(Color.FromArgb(255, 196, 140, 84), 1f * u))
+                    g.DrawLine(pen, c - 0.6f * u, hb - 15 * u, c + 0.9f * u, hb - 41 * u);
+                using (var pen = new Pen(Color.FromArgb(255, 40, 40, 46), 1.8f * u))
+                {
+                    g.DrawLine(pen, c - 2.5f * u, hb - 43 * u, c + 5.5f * u, hb - 43 * u);
+                    g.DrawLine(pen, c - 2.5f * u, hb - 43 * u, c - 1 * u, hb - 48 * u);
+                    g.DrawLine(pen, c + 5.5f * u, hb - 43 * u, c + 4 * u, hb - 48 * u);
+                    g.DrawLine(pen, c - 1 * u, hb - 48 * u, c + 4 * u, hb - 48 * u);
+                }
+                var blade = new PointF[] { new PointF(c - 7 * u, hb - 15 * u), new PointF(c + 7 * u, hb - 15 * u), new PointF(c + 8 * u, hb - 1 * u), new PointF(c, hb), new PointF(c - 8 * u, hb - 1 * u) };
+                using (var b = new LinearGradientBrush(new RectangleF(c - 8 * u, hb - 15 * u, 16 * u, 15 * u), Color.FromArgb(255, 96, 158, 232), Color.FromArgb(255, 52, 108, 190), 0f))
+                    g.FillPolygon(b, blade);
+                using (var pen = new Pen(Color.FromArgb(255, 30, 70, 130), 0.8f * u)) g.DrawPolygon(pen, blade);
+                using (var b = new SolidBrush(Color.FromArgb(255, 250, 252, 255))) g.FillEllipse(b, c - 9 * u, hb - 4 * u, 18 * u, 6 * u);
+            });
+        }
+
+        // Rohrstück, aus dem Boden ragend: [0] Öffnung links, [1] Öffnung rechts. Anker = Mitte der Öffnung, Boden.
+        public static Art[] Pipe(float u)
+        {
+            int w = (int)Math.Ceiling(60 * u), h = (int)Math.Ceiling(46 * u);
+            int ax = (int)(7 * u);
+            var res = new Art[2];
+            for (int dir = 0; dir < 2; dir++)
+            {
+                res[dir] = Build(w, h, ax, h, dir == 1, delegate (Graphics g)
+                {
+                    float hb = h - 0.5f, top = hb - 42 * u;
+                    var tube = new RectangleF(6 * u, top + 1 * u, 44 * u, 41 * u);
+                    // Zylinder-Schattierung
+                    using (var b = new LinearGradientBrush(tube, Color.Black, Color.Black, 90f))
+                    {
+                        var cb = new ColorBlend();
+                        cb.Colors = new Color[] { Color.FromArgb(255, 120, 130, 146), Color.FromArgb(255, 205, 214, 226), Color.FromArgb(255, 150, 160, 176), Color.FromArgb(255, 80, 88, 102) };
+                        cb.Positions = new float[] { 0f, 0.28f, 0.6f, 1f };
+                        b.InterpolationColors = cb;
+                        g.FillRectangle(b, tube);
+                    }
+                    // Bogen nach unten in den Boden
+                    using (var b = new LinearGradientBrush(new RectangleF(44 * u, top + 1 * u, 16 * u, 41 * u), Color.FromArgb(255, 170, 180, 196), Color.FromArgb(255, 84, 92, 106), 0f))
+                        g.FillPie(b, 30 * u, top + 1 * u, 28 * u, 82 * u, 270, 90);
+                    // Ringe mit Nieten
+                    for (int k = 0; k < 2; k++)
+                    {
+                        float x = (22 + k * 16) * u;
+                        using (var b = new SolidBrush(Color.FromArgb(255, 92, 100, 116))) g.FillRectangle(b, x, top + 1 * u, 3 * u, 41 * u);
+                        using (var b = new SolidBrush(Color.FromArgb(255, 200, 206, 216)))
+                            for (int n = 0; n < 4; n++) g.FillEllipse(b, x + 0.6f * u, top + (5 + n * 10) * u, 1.8f * u, 1.8f * u);
+                    }
+                    // Flansch mit Warnstreifen
+                    var flange = new RectangleF(0, top, 14 * u, 42 * u);
+                    using (var b = new SolidBrush(Color.FromArgb(255, 245, 170, 40))) g.FillEllipse(b, flange);
+                    using (var pen = new Pen(Color.FromArgb(255, 40, 40, 46), 2.2f * u))
+                    {
+                        var st = g.Save();
+                        using (var clip = new GraphicsPath()) { clip.AddEllipse(flange); g.SetClip(clip); }
+                        for (int k = -4; k < 8; k++) g.DrawLine(pen, k * 5 * u, top + 42 * u, k * 5 * u + 14 * u, top);
+                        g.Restore(st);
+                    }
+                    using (var pen = new Pen(Color.FromArgb(255, 60, 50, 30), 0.8f * u)) g.DrawEllipse(pen, flange);
+                    // dunkle Öffnung
+                    using (var b = new SolidBrush(Color.FromArgb(255, 16, 18, 24))) g.FillEllipse(b, 2.5f * u, top + 3 * u, 9 * u, 36 * u);
+                    // Schnee auf dem Rohr
+                    using (var b = new SolidBrush(Color.FromArgb(255, 250, 252, 255)))
+                        g.FillEllipse(b, 10 * u, top - 1.5f * u, 36 * u, 4 * u);
                 });
             }
             return res;
@@ -457,7 +850,7 @@ namespace Snowglobe
     // ------------------------------------------------------------ Simulation
 
     struct Flake { public float X, Y, Vy, R, Phase, Freq, Amp, Alpha, Drift; public int Cls; }
-    struct Debris { public float X, Y, Vx, Vy, R, Alpha; public int Cls; }
+    struct Debris { public float X, Y, Vx, Vy, R, Alpha, G, Delay, Ph; public int Cls; }
     struct WinInfo { public IntPtr H; public RECT R; public bool Surface, Big; }
 
     // Eine horizontale Kante, auf der Schnee liegen bleibt (Fenster, Icon, Boden).
@@ -466,19 +859,19 @@ namespace Snowglobe
         public readonly long Key;
         public readonly int Kind, X0, X1, Y, N;     // Kind: 0 Boden, 1 Fenster, 2 Icon
         public readonly float MaxH;
-        public readonly float[] H, Cap, Cap2, ClipY;
+        public readonly float[] H, Cap, Cap2, ClipY, Off;
         public readonly bool[] Vis;
         public readonly int[] Cover;
         public int Z;
         public bool Seen;
         public float Peak;
 
-        public Surface(long key, int kind, int x0, int x1, int y, float maxH, bool taper)
+        public Surface(long key, int kind, int x0, int x1, int y, float maxH, bool taper, float pushFactor, float cornerR)
         {
             Key = key; Kind = kind; X0 = x0; X1 = x1; Y = y; MaxH = maxH; N = x1 - x0;
-            H = new float[N]; Cap = new float[N]; Cap2 = new float[N]; ClipY = new float[N];
+            H = new float[N]; Cap = new float[N]; Cap2 = new float[N]; ClipY = new float[N]; Off = new float[N];
             Vis = new bool[N]; Cover = new int[N];
-            float max2 = maxH * 2.5f;
+            float max2 = maxH * pushFactor;
             for (int j = 0; j < N; j++)
             {
                 float edge = Math.Min(j, N - 1 - j) + 1;
@@ -487,14 +880,22 @@ namespace Snowglobe
                 Vis[j] = true;
                 ClipY[j] = -1e9f;
                 Cover[j] = -1;
+                // abgerundete Fensterecken (Windows 11): Kante fällt zum Rand hin ab
+                if (cornerR > 0 && edge - 0.5f < cornerR)
+                {
+                    float d = cornerR - (edge - 0.5f);
+                    Off[j] = cornerR - (float)Math.Sqrt(Math.Max(0f, cornerR * cornerR - d * d));
+                }
             }
         }
+
+        public float Base(int j) { return Y + Off[j]; }
 
         public float Top(float x)
         {
             int j = (int)x - X0;
             if (j < 0) j = 0; else if (j >= N) j = N - 1;
-            return Y - H[j];
+            return Y + Off[j] - H[j];
         }
 
         public float Sum(int from, int to)
@@ -571,27 +972,28 @@ namespace Snowglobe
 
     sealed class Robot
     {
-        public const int Idle = 0, Travel = 1, Push = 2, Hop = 3, Fall = 4;
+        public const int Idle = 0, Travel = 1, Push = 2, Hop = 3, Fall = 4, GoPipe = 5, Exit = 6, Gone = 7;
         public Surface Surf;
         public float X, Yb, Load, Vy, IdleT, Anim, Blink;
         public int Dir = 1, State = Fall;
         public bool Blade;
-        public float TargetX, ParkX = float.NaN;
+        public float TargetX;
         public bool PushAfter, Spill;
         public Run Cur;
         public readonly List<Run> Runs = new List<Run>();
         public float H0x, H0y, H1x, H1y, HT, HDur, HArc;
         public Surface HopSurf;
-        public bool CleanAfter;
-        public float CleanHeap = float.NaN;
-        public bool PendingClean;
-        public float PendingHeap = float.NaN;
-        public bool Busy { get { return State == Travel || State == Push || State == Hop || Runs.Count > 0; } }
+        public bool CleanAfter, AfterHopPipe;
+        // Monitorwechsel durch die Röhre
+        public World Target;
+        public bool NoJob, PendingAuto, PendingSend;
+        public float PendingX, PendingY;
+        public bool Busy { get { return State != Idle || Runs.Count > 0; } }
     }
 
     struct Run { public float Start, End; public int Dir; }
 
-    // Ein Monitor: Overlay, Flocken, Schneehaufen, ggf. Roboter und Schaufel.
+    // Ein Monitor: Overlay, Flocken, Schneehaufen, ggf. Roboter, Röhre und Schaufel.
     unsafe sealed class World : IDisposable
     {
         public static float DepositBoost = 1f;
@@ -602,14 +1004,15 @@ namespace Snowglobe
         public readonly Overlay Ov;
         public bool Hidden, Covered;
         public Robot Bot;
-        public bool ShovelOn, MarkerOn;
+        public bool ShovelOn, MarkerOn, ShovelParked;
+        public bool RobotGone;
         float shX, shY, shLoad, mkX, mkY;
         int shDir = 1;
 
         readonly int W, Hh;
         Flake[] fl = new Flake[0];
         int nfl;
-        readonly Debris[] db = new Debris[8000];
+        Debris[] db = new Debris[8000];
         int ndb;
         readonly List<Surface> surfs = new List<Surface>();
         readonly Dictionary<long, Surface> map = new Dictionary<long, Surface>();
@@ -617,28 +1020,34 @@ namespace Snowglobe
         readonly Random rnd;
         List<Rectangle> dirty = new List<Rectangle>(2048), dirtyPrev = new List<Rectangle>(2048);
         bool groundFade, flip;
-        float time;
+        float time, wind;
 
-        readonly Art[] robotArt, shovelArt;
-        readonly Art markerArt, lampRed, lampAmber;
-        readonly float RF, RB;
-        public readonly float GroundHeapX;
+        // Röhre
+        int pipeState;          // 0 weg, 1 auftauchen/da, 2 verschwinden
+        float pipeX, pipeAnim, pipeCloseT;
+        bool pipeMouthRight;
+
+        readonly Art[] robotArt, shovelArt, pipeArt;
+        readonly Art markerArt, lampRed, lampAmber, shovelStand;
+        readonly float RF, RB, EdgeHeap;
 
         public World(Rectangle bounds, Rectangle work, float scale, int seed)
         {
             B = bounds; Work = work; S = scale;
             W = B.Width; Hh = B.Height;
             rnd = new Random(seed);
-            Ov = new Overlay(B);
+            Ov = Overlay.Create(B);
             int gy = Math.Min(Hh, Work.Bottom - B.Top);
-            ground = new Surface(-1, 0, 0, W, gy, 26f * S, false);
+            ground = new Surface(-1, 0, 0, W, gy, 26f * S, false, 4f, 0f);
             surfs.Add(ground);
             robotArt = Art.Robot(S, out RF, out RB);
             shovelArt = Art.Shovel(S);
+            shovelStand = Art.ShovelStand(S);
+            pipeArt = Art.Pipe(S);
             markerArt = Art.Marker(S);
             lampRed = Art.Lamp(S, Color.FromArgb(255, 255, 60, 50));
             lampAmber = Art.Lamp(S, Color.FromArgb(255, 255, 180, 30));
-            GroundHeapX = 90f * S;
+            EdgeHeap = 26f * S;
         }
 
         float Rnd() { return (float)rnd.NextDouble(); }
@@ -682,7 +1091,7 @@ namespace Snowglobe
                 if (xi < s.X0 || xi >= s.X1) continue;
                 int i = xi - s.X0;
                 if (!s.Vis[i]) continue;
-                float top = s.Y - s.H[i];
+                float top = s.Y + s.Off[i] - s.H[i];
                 if (yPrev <= top && y >= top && top < bestTop && top >= s.ClipY[i])
                 {
                     best = s; bestTop = top; bi = i;
@@ -696,7 +1105,7 @@ namespace Snowglobe
         public void Step(float dt, float t)
         {
             time = t;
-            float wind = S * (float)(11 * Math.Sin(t * 0.07) + 6 * Math.Sin(t * 0.19 + 1.3) + 3 * Math.Sin(t * 0.43 + 2.1));
+            wind = S * (float)(11 * Math.Sin(t * 0.07) + 6 * Math.Sin(t * 0.19 + 1.3) + 3 * Math.Sin(t * 0.43 + 2.1));
 
             for (int i = 0; i < nfl; i++)
             {
@@ -710,23 +1119,9 @@ namespace Snowglobe
                 fl[i] = f;
             }
 
-            float g = 520f * S, term = 280f * S;
-            for (int i = 0; i < ndb; )
-            {
-                Debris d = db[i];
-                float yPrev = d.Y;
-                d.Vy = Math.Min(term, d.Vy + g * dt);
-                d.Vx *= 1f - 1.5f * dt;
-                d.X += d.Vx * dt;
-                d.Y += d.Vy * dt;
-                bool dead = d.Y > Hh + 10 || d.X < -20 || d.X > W + 20
-                         || TryLand(d.X, yPrev, d.Y, 2.2f * d.R * d.R);
-                if (dead) { db[i] = db[--ndb]; continue; }
-                db[i] = d;
-                i++;
-            }
-
+            StepDebris(dt);
             if (Bot != null) StepRobot(dt);
+            StepPipe(dt);
 
             flip = !flip;
             float melt = 0.006f * S;
@@ -738,11 +1133,54 @@ namespace Snowglobe
             if (groundFade && ground.Peak <= 0f) groundFade = false;
         }
 
+        // Herabfallender Schnee: bröckelt von oben nach unten ab, Klumpen fallen schneller als Pulver.
+        void StepDebris(float dt)
+        {
+            float g = 520f * S;
+            for (int i = 0; i < ndb; )
+            {
+                Debris d = db[i];
+                if (d.Delay > 0f)
+                {
+                    d.Delay -= dt;
+                    db[i] = d; i++;
+                    continue;
+                }
+                float yPrev = d.Y;
+                float term = (150f + 170f * d.G) * S;
+                d.Vy = Math.Min(term, d.Vy + g * d.G * dt);
+                d.Vx += (wind * (1.3f - d.G) - d.Vx) * Math.Min(1f, 1.4f * dt);
+                d.X += (d.Vx + (float)Math.Sin(time * 4f + d.Ph) * 9f * S * (1.2f - d.G)) * dt;
+                d.Y += d.Vy * dt;
+                bool dead = d.Y > Hh + 10 || d.X < -20 || d.X > W + 20
+                         || TryLand(d.X, yPrev, d.Y, 2.2f * d.R * d.R);
+                if (dead) { db[i] = db[--ndb]; continue; }
+                db[i] = d;
+                i++;
+            }
+        }
+
+        void AddDebris(float x, float y, float vx, float vy, float delay, bool clump)
+        {
+            if (ndb >= db.Length) return;
+            Debris d;
+            float r = clump ? (1.7f + Rnd() * 1.3f) : (0.8f + Rnd() * 0.8f);
+            d.R = r * S;
+            d.G = clump ? 0.9f + Rnd() * 0.2f : 0.55f + Rnd() * 0.3f;
+            d.X = x; d.Y = y;
+            d.Vx = vx; d.Vy = vy;
+            d.Alpha = clump ? 0.95f : 0.75f + 0.2f * Rnd();
+            d.Delay = delay;
+            d.Ph = Rnd() * 6.28f;
+            d.Cls = Sprites.ClassFor(d.R);
+            db[ndb++] = d;
+        }
+
         // ---- Schnee bewegen
 
         // Schnee oberhalb der Höhe h0 im Spaltenbereich [wx0, wx1) aufnehmen; was über
         // "keep" hinausgeht, wird vor dem Schild in Richtung dir abgelegt (Schneepflug).
-        void Plow(Surface s, float wx0, float wx1, float h0, int dir, ref float load, float keep)
+        void Plow(Surface s, float wx0, float wx1, float h0, int dir, ref float load, float keep, bool spillOver)
         {
             int c0 = Math.Max(0, (int)wx0 - s.X0), c1 = Math.Min(s.N, (int)wx1 - s.X0);
             for (int j = c0; j < c1; j++)
@@ -759,7 +1197,7 @@ namespace Snowglobe
             {
                 int j = f + k * dir;
                 float part = amt * (w - k) / sum;
-                if (j < 0 || j >= s.N) { spill += part; continue; }
+                if (j < 0 || j >= s.N) { if (spillOver) spill += part; else left += part; continue; }
                 float room = Math.Max(0f, s.Cap2[j] - s.H[j]);
                 float add = Math.Min(room, part);
                 s.H[j] += add;
@@ -795,19 +1233,10 @@ namespace Snowglobe
         // Schnee als herabfallende Brocken freisetzen.
         void Spill(float x, float y, float amount, float vx, float vy)
         {
-            int n = Math.Min(900, (int)(amount / (3.4f * S * S)) + 1);
-            for (int i = 0; i < n && ndb < db.Length; i++)
-            {
-                Debris d;
-                d.X = x + (Rnd() - 0.5f) * 8f * S;
-                d.Y = y - Rnd() * 6f * S;
-                d.Vx = vx + (Rnd() - 0.5f) * 40f * S;
-                d.Vy = vy + (Rnd() - 0.6f) * 40f * S;
-                d.R = (0.8f + Rnd() * 0.9f) * S;
-                d.Alpha = 0.85f + 0.15f * Rnd();
-                d.Cls = Sprites.ClassFor(d.R);
-                db[ndb++] = d;
-            }
+            int n = Math.Min(900, (int)(amount / (5f * S * S)) + 1);
+            for (int i = 0; i < n; i++)
+                AddDebris(x + (Rnd() - 0.5f) * 8f * S, y - Rnd() * 6f * S,
+                          vx + (Rnd() - 0.5f) * 40f * S, vy + (Rnd() - 0.6f) * 40f * S, Rnd() * 0.08f, Rnd() < 0.35f);
         }
 
         // ---- Schaufel
@@ -830,11 +1259,11 @@ namespace Snowglobe
                         var s = surfs[k];
                         int col = (int)qx - s.X0;
                         if (col < 0 || col >= s.N || !s.Vis[col]) continue;
-                        float top = s.Y - s.H[col];
-                        if (qy < top - 1f || qy > s.Y + 8f * S) continue;
-                        float h0 = s.Y - qy;
+                        float bse = s.Base(col), top = bse - s.H[col];
+                        if (qy < top - 1f || qy > bse + 8f * S) continue;
+                        float h0 = bse - qy;
                         if (h0 < 3f * S) h0 = 0f;   // Blatt am Boden: sauber bis unten räumen
-                        Plow(s, qx - bw, qx + bw, h0, sdx, ref load, cap);
+                        Plow(s, qx - bw, qx + bw, h0, sdx, ref load, cap, true);
                     }
                 }
             }
@@ -849,21 +1278,21 @@ namespace Snowglobe
 
         public void SetMarker(float x, float y) { MarkerOn = true; mkX = x; mkY = y; }
 
+        float ParkX { get { return W - 120f * S; } }
+
+        public Rectangle ShovelParkRect()
+        {
+            var a = shovelStand;
+            float y = ground.Top(ParkX) + 4f * S;
+            int m = (int)(5 * S);
+            return new Rectangle(B.X + (int)ParkX - a.AX - m, B.Y + (int)y - a.H - m, a.W + 2 * m, a.H + 2 * m);
+        }
+
         // ---- Roboter
 
         bool RobotSurface(Surface s)
         {
             return s == ground || (s.Kind == 1 && s.N >= (RF + RB) * 3);
-        }
-
-        public void RobotEnter(Robot r, float x, bool clean, float heap)
-        {
-            Bot = r;
-            r.Surf = null; r.State = Robot.Fall; r.Vy = 0;
-            r.X = Math.Max(RB + 2, Math.Min(W - RF - 2, x));
-            r.Yb = -2f;
-            r.Runs.Clear(); r.Load = 0; r.Blade = false;
-            r.PendingClean = clean; r.PendingHeap = heap;
         }
 
         public void RobotPlace(Robot r)
@@ -873,10 +1302,19 @@ namespace Snowglobe
             r.X = W * 0.18f; r.Yb = ground.Y;
         }
 
+        public void RobotDrop(Robot r, float x)
+        {
+            Bot = r;
+            r.Surf = null; r.State = Robot.Fall; r.Vy = 0;
+            r.X = Math.Max(RB + 2, Math.Min(W - RF - 2, x));
+            r.Yb = -2f;
+            r.Runs.Clear(); r.Load = 0; r.Blade = false;
+        }
+
         public bool RobotVisible()
         {
             var b = Bot;
-            if (b == null) return false;
+            if (b == null || b.State == Robot.Gone) return false;
             if (b.Surf == null || b.State == Robot.Hop || b.State == Robot.Fall) return true;
             int j = (int)b.X - b.Surf.X0;
             return j < 0 || j >= b.Surf.N || b.Surf.Vis[j];
@@ -890,17 +1328,21 @@ namespace Snowglobe
             return new Rectangle(B.X + (int)b.X - a.AX - m, B.Y + (int)b.Yb - a.H - m, a.W + 2 * m, a.H + 2 * m);
         }
 
+        public bool RobotFree { get { var b = Bot; return b != null && b.Surf != null && (b.State == Robot.Idle || b.State == Robot.Travel || b.State == Robot.Push); } }
+
+        // Anklicken: aktuelle Fläche zum Rand hin räumen.
         public void Poke()
         {
             var b = Bot;
-            if (b == null || b.Surf == null || b.State == Robot.Hop || b.State == Robot.Fall) return;
-            HopTo(b.Surf, b.X, true, b.Surf == ground ? b.X : float.NaN);
+            if (!RobotFree) return;
+            HopTo(b.Surf, b.X, true);
         }
 
-        // Roboter zu einer angeklickten Stelle schicken; dort entsteht der Haufen.
+        // Roboter zu einer angeklickten Stelle schicken; dort räumt er die Fläche.
         public void SendTo(float x, float y)
         {
             var b = Bot;
+            if (!RobotFree) { b.PendingSend = true; b.PendingX = x; b.PendingY = y; return; }
             Surface best = null;
             float bd = float.MaxValue;
             for (int k = 0; k < surfs.Count; k++)
@@ -909,80 +1351,73 @@ namespace Snowglobe
                 if (!RobotSurface(s)) continue;
                 int col = (int)x - s.X0;
                 if (col < 0 || col >= s.N || !s.Vis[col]) continue;
-                float top = s.Y - s.H[col];
+                float top = s.Base(col) - s.H[col];
                 if (y < top - 50f * S || y > s.Y + 30f * S) continue;
                 float d = Math.Abs(y - top);
                 if (d < bd) { bd = d; best = s; }
             }
             if (best == null) best = ground;
-            if (b.State == Robot.Fall || b.Surf == null) { b.PendingClean = true; b.PendingHeap = x; return; }
-            HopTo(best, x, true, x);
+            HopTo(best, x, true);
         }
 
-        void HopTo(Surface s, float x, bool clean, float heap)
+        void HopTo(Surface s, float x, bool clean)
         {
             var b = Bot;
-            if (b.Load > 0.5f) { Spill(b.X + b.Dir * RF, b.Yb - 3 * S, b.Load, 0, 0); b.Load = 0; }
+            if (b.Load > 0.5f && b.Surf != null) Fill(b.Surf, b.X + b.Dir * RF, ref b.Load);
+            b.Load = 0;
             b.H0x = b.X; b.H0y = b.Yb;
-            b.H1x = Math.Max(s.X0 + RB + 1, Math.Min(s.X1 - RF - 1, x));
+            b.H1x = Math.Max(s.X0 + RF + 1, Math.Min(s.X1 - RF - 1, x));
             b.H1y = s.Top(b.H1x);
             float dist = Math.Abs(b.H1x - b.H0x) + Math.Abs(b.H1y - b.H0y);
             b.HDur = 0.45f + dist / (1500f * S);
             b.HArc = 40f * S + Math.Max(0f, b.H0y - b.H1y) * 0.6f + dist * 0.05f;
             b.HT = 0;
             b.HopSurf = s;
-            b.CleanAfter = clean; b.CleanHeap = heap;
+            b.CleanAfter = clean;
             if (Math.Abs(b.H1x - b.H0x) > 1) b.Dir = b.H1x > b.H0x ? 1 : -1;
             b.State = Robot.Hop; b.Blade = false;
             b.Runs.Clear();
         }
 
-        void StartClean(Surface s, float heap)
+        // Schnee einer Fläche zu den Rändern schieben: linke Hälfte nach links, rechte nach rechts.
+        // Am Boden entstehen große Haufen am Bildschirmrand, von Fenstern fällt der Schnee über die Kante.
+        void StartClean(Surface s)
         {
             var b = Bot;
             b.Surf = s;
             b.Runs.Clear();
-            b.Spill = float.IsNaN(heap);
-            float lo = s.X0 + RB + 1, hi = s.X1 - RF - 1;
-            b.ParkX = float.NaN;
-            if (hi > lo)
+            b.Spill = s != ground;
+            float gap = s == ground ? EdgeHeap : 0f;
+            float minX = s.X0 + RF + 1, maxX = s.X1 - RF - 1;     // Schild darf bis an den Rand
+            if (maxX > minX)
             {
-                if (b.Spill)
+                int mid = s.N / 2;
+                int lastL = -1, firstR = -1;
+                for (int j = 0; j < mid; j++) if (s.H[j] > 0.6f) lastL = j;
+                for (int j = s.N - 1; j >= mid; j--) if (s.H[j] > 0.6f) firstR = j;
+                int lastLeftCol = -1;
+                for (int j = mid - 1; j >= 0; j--) if (s.H[j] > 0.6f) { lastLeftCol = j; break; }
+                int firstRightCol = -1;
+                for (int j = mid; j < s.N; j++) if (s.H[j] > 0.6f) { firstRightCol = j; break; }
+                // linke Hälfte: von innen nach links schieben
+                if (lastLeftCol >= 0)
                 {
                     var r = new Run();
-                    if (b.X - s.X0 < s.X1 - b.X) { r.Start = hi; r.End = lo; r.Dir = -1; }
-                    else { r.Start = lo; r.End = hi; r.Dir = 1; }
-                    b.Runs.Add(r);
+                    r.Dir = -1;
+                    r.Start = Math.Max(minX, Math.Min(maxX, s.X0 + lastLeftCol + RF + 2));
+                    r.End = Math.Max(minX, Math.Min(maxX, s.X0 + gap + RF));
+                    if (r.Start > r.End + 3) b.Runs.Add(r);
                 }
-                else
+                // rechte Hälfte: von innen nach rechts schieben
+                if (firstRightCol >= 0)
                 {
-                    float hx = Math.Max(s.X0, Math.Min(s.X1, heap));
-                    var runs = new List<Run>();
-                    int first = -1, last = -1;
-                    for (int j = 0; j < s.N; j++)
-                        if (s.H[j] > 0.6f) { if (first < 0) first = j; last = j; }
-                    if (first >= 0 && s.X0 + first < hx - 6 * S)
-                    {
-                        var r = new Run();
-                        r.Start = Math.Max(lo, s.X0 + first - RF);
-                        r.End = Math.Min(hi, hx - RF);
-                        r.Dir = 1;
-                        if (r.End > r.Start + 3) runs.Add(r);
-                    }
-                    if (last >= 0 && s.X0 + last > hx + 6 * S)
-                    {
-                        var r = new Run();
-                        r.Start = Math.Min(hi, s.X0 + last + RF);
-                        r.End = Math.Max(lo, hx + RF);
-                        r.Dir = -1;
-                        if (r.Start > r.End + 3) runs.Add(r);
-                    }
-                    if (runs.Count == 2 && Math.Abs(runs[1].Start - b.X) < Math.Abs(runs[0].Start - b.X)) runs.Reverse();
-                    b.Runs.AddRange(runs);
-                    float park = hx - 70f * S;
-                    if (park < lo) park = hx + 70f * S;
-                    b.ParkX = Math.Max(lo, Math.Min(hi, park));
+                    var r = new Run();
+                    r.Dir = 1;
+                    r.Start = Math.Max(minX, Math.Min(maxX, s.X0 + firstRightCol - RF - 2));
+                    r.End = Math.Max(minX, Math.Min(maxX, s.X1 - gap - RF));
+                    if (r.End > r.Start + 3) b.Runs.Add(r);
                 }
+                if (b.Runs.Count == 2 && Math.Abs(b.Runs[1].Start - b.X) < Math.Abs(b.Runs[0].Start - b.X)) b.Runs.Reverse();
             }
             NextRun();
         }
@@ -997,14 +1432,10 @@ namespace Snowglobe
                 b.TargetX = b.Cur.Start; b.PushAfter = true;
                 b.State = Robot.Travel; b.Blade = false;
             }
-            else if (!float.IsNaN(b.ParkX))
-            {
-                b.TargetX = b.ParkX; b.ParkX = float.NaN; b.PushAfter = false;
-                b.State = Robot.Travel; b.Blade = false;
-            }
             else
             {
                 b.State = Robot.Idle; b.IdleT = 0; b.Blade = false;
+                if (b.PendingSend) { b.PendingSend = false; SendTo(b.PendingX, b.PendingY); }
             }
         }
 
@@ -1023,7 +1454,8 @@ namespace Snowglobe
                 case Robot.Idle:
                     b.IdleT += dt;
                     b.Yb += (b.Surf.Top(b.X) - b.Yb) * follow;
-                    if (RobotAuto && b.IdleT > 5f) AutoJob();
+                    if (b.PendingSend) { b.PendingSend = false; SendTo(b.PendingX, b.PendingY); }
+                    else if (RobotAuto && b.IdleT > 5f) { b.IdleT = 0; if (!AutoJob()) b.NoJob = true; }
                     break;
 
                 case Robot.Travel:
@@ -1049,8 +1481,8 @@ namespace Snowglobe
                     bool reached = b.Dir > 0 ? b.X >= b.Cur.End : b.X <= b.Cur.End;
                     if (reached) b.X = b.Cur.End;
                     float front = b.X + b.Dir * RF, back = b.X - b.Dir * RB;
-                    Plow(s, Math.Min(front, back), Math.Max(front, back), 0f, b.Dir, ref b.Load, 0f);
-                    b.Yb += (s.Y - b.Yb) * follow;
+                    Plow(s, Math.Min(front, back), Math.Max(front, back), 0f, b.Dir, ref b.Load, 0f, b.Spill);
+                    b.Yb += (s.Base(Math.Max(0, Math.Min(s.N - 1, (int)b.X - s.X0))) - b.Yb) * follow;
                     if (reached)
                     {
                         if (b.Spill)
@@ -1079,7 +1511,8 @@ namespace Snowglobe
                         if (!surfs.Contains(b.HopSurf)) { b.State = Robot.Fall; b.Vy = 0; b.Surf = null; break; }
                         b.Surf = b.HopSurf;
                         b.X = b.H1x;
-                        if (b.CleanAfter) StartClean(b.Surf, b.CleanHeap);
+                        if (b.AfterHopPipe) { b.AfterHopPipe = false; b.State = Robot.GoPipe; b.Dir = pipeMouthRight ? -1 : 1; }
+                        else if (b.CleanAfter) StartClean(b.Surf);
                         else { b.State = Robot.Idle; b.IdleT = 0; }
                     }
                     break;
@@ -1097,7 +1530,7 @@ namespace Snowglobe
                     {
                         var s = surfs[k];
                         if (!RobotSurface(s) || xi < s.X0 || xi >= s.X1 || !s.Vis[xi - s.X0]) continue;
-                        float top = s.Y - s.H[xi - s.X0];
+                        float top = s.Base(xi - s.X0) - s.H[xi - s.X0];
                         if (yPrev <= top + 1 && b.Yb >= top && top < bt) { bt = top; landed = s; }
                     }
                     if (landed == null && b.Yb > Hh + 40) { landed = ground; bt = ground.Top(b.X); }
@@ -1105,15 +1538,42 @@ namespace Snowglobe
                     {
                         b.Surf = landed;
                         b.Yb = bt;
-                        b.X = Math.Max(landed.X0 + RB + 1, Math.Min(landed.X1 - RF - 1, b.X));
+                        b.X = Math.Max(landed.X0 + RF + 1, Math.Min(landed.X1 - RF - 1, b.X));
                         b.State = Robot.Idle; b.IdleT = 0;
-                        if (b.PendingClean)
+                        if (b.AfterHopPipe)
                         {
-                            b.PendingClean = false;
-                            float heap = b.PendingHeap;
-                            if (float.IsNaN(heap)) heap = landed == ground ? b.X : float.NaN;
-                            StartClean(landed, heap);
+                            if (landed == ground) { b.AfterHopPipe = false; b.State = Robot.GoPipe; b.Dir = pipeMouthRight ? -1 : 1; }
+                            else { HopTo(ground, pipeX + (pipeMouthRight ? RF + 30f * S : -RF - 30f * S), false); b.AfterHopPipe = true; }
                         }
+                    }
+                    break;
+                }
+
+                case Robot.GoPipe:
+                {
+                    // zur Röhre fahren und hinein
+                    float step = 115f * S * dt;
+                    b.Dir = pipeMouthRight ? -1 : 1;
+                    b.X += b.Dir * step; b.Anim += step;
+                    b.Yb += (ground.Top(b.X) - b.Yb) * follow;
+                    bool inside = pipeMouthRight ? b.X + RB < pipeX - 2f * S : b.X - RB > pipeX + 2f * S;
+                    if (inside && pipeAnim >= 1f) { b.State = Robot.Gone; RobotGone = true; }
+                    break;
+                }
+
+                case Robot.Exit:
+                {
+                    if (pipeAnim < 1f) break;
+                    float step = 90f * S * dt;
+                    b.X += b.Dir * step; b.Anim += step;
+                    b.Yb += (ground.Top(b.X) - b.Yb) * follow;
+                    bool outside = b.Dir > 0 ? b.X - RB > pipeX + 10f * S : b.X + RB < pipeX - 10f * S;
+                    if (outside)
+                    {
+                        b.State = Robot.Idle; b.IdleT = 0;
+                        pipeCloseT = 0.8f;
+                        if (b.PendingSend) { b.PendingSend = false; SendTo(b.PendingX, b.PendingY); }
+                        else if (b.PendingAuto) { b.PendingAuto = false; if (!AutoJob()) b.NoJob = true; }
                     }
                     break;
                 }
@@ -1121,31 +1581,106 @@ namespace Snowglobe
         }
 
         // Automatik: die Fläche mit dem meisten Schnee räumen.
-        void AutoJob()
+        bool AutoJob()
         {
-            var b = Bot;
-            b.IdleT = 0;
             Surface best = null;
             float bestAmt = 0;
             for (int k = 0; k < surfs.Count; k++)
             {
                 var s = surfs[k];
-                if (!RobotSurface(s) || !s.Vis[s.N / 2]) continue;
-                float amt;
-                if (s == ground)
-                {
-                    int hx = (int)GroundHeapX, r = (int)(160 * S);
-                    amt = s.Sum(0, hx - r) + s.Sum(hx + r, s.N);
-                }
-                else amt = s.Sum(0, s.N);
-                if (amt < 2.2f * S * s.N) continue;
+                float amt = JobAmount(s);
                 if (amt > bestAmt) { bestAmt = amt; best = s; }
             }
-            if (best == null) return;
-            float heap = best == ground ? GroundHeapX : float.NaN;
-            if (best == b.Surf) StartClean(best, heap);
-            else HopTo(best, (best.X0 + best.X1) / 2f, true, heap);
+            if (best == null) return false;
+            if (best == Bot.Surf) StartClean(best);
+            else HopTo(best, (best.X0 + best.X1) / 2f, true);
+            return true;
         }
+
+        float JobAmount(Surface s)
+        {
+            if (!RobotSurface(s) || !s.Vis[s.N / 2]) return 0;
+            float amt;
+            if (s == ground)
+            {
+                int r = (int)(EdgeHeap + 220f * S);   // Randhaufen nicht mitzählen
+                amt = s.Sum(r, s.N - r);
+                return amt >= 2.2f * S * (s.N - 2 * r) ? amt : 0;
+            }
+            amt = s.Sum(0, s.N);
+            return amt >= 2.2f * S * s.N ? amt : 0;
+        }
+
+        // für die App: lohnt sich ein Besuch auf diesem Monitor?
+        public float JobScore()
+        {
+            float best = 0;
+            for (int k = 0; k < surfs.Count; k++) best = Math.Max(best, JobAmount(surfs[k]));
+            return best;
+        }
+
+        // ---- Röhre (Monitorwechsel)
+
+        void OpenPipe(float x, bool mouthRight)
+        {
+            pipeX = Math.Max(140f * S, Math.Min(W - 140f * S, x));
+            pipeMouthRight = mouthRight;
+            if (pipeState == 0) pipeAnim = 0;
+            pipeState = 1;
+            pipeCloseT = 0;
+        }
+
+        void StepPipe(float dt)
+        {
+            if (pipeState == 1)
+            {
+                pipeAnim = Math.Min(1f, pipeAnim + dt * 2.2f);
+                if (pipeCloseT > 0) { pipeCloseT -= dt; if (pipeCloseT <= 0) pipeState = 2; }
+            }
+            else if (pipeState == 2)
+            {
+                pipeAnim -= dt * 2.2f;
+                if (pipeAnim <= 0) { pipeAnim = 0; pipeState = 0; }
+            }
+        }
+
+        // Roboter verlässt diesen Monitor in Richtung 'side' (+1 rechts, -1 links).
+        public void SendAway(int side)
+        {
+            var b = Bot;
+            if (b == null) return;
+            b.Runs.Clear(); b.Blade = false;
+            float px = b.X + side * 140f * S;
+            if (px > W - 140f * S || px < 140f * S) px = b.X - side * 140f * S;
+            // Öffnung zeigt zum Roboter
+            OpenPipe(px, px < b.X);
+            if (b.State == Robot.Fall || b.State == Robot.Hop) { b.AfterHopPipe = true; return; }
+            if (b.Surf != ground)
+            {
+                HopTo(ground, pipeX + (pipeMouthRight ? RF + 30f * S : -RF - 30f * S), false);
+                b.AfterHopPipe = true;
+                return;
+            }
+            if (b.Load > 0.5f) Fill(ground, b.X, ref b.Load);
+            b.State = Robot.GoPipe;
+        }
+
+        // Roboter kommt aus einer Röhre auf diesem Monitor heraus.
+        public void Receive(Robot r, int side, float nearX)
+        {
+            Bot = r;
+            RobotGone = false;
+            r.Surf = ground; r.Runs.Clear(); r.Blade = false; r.Load = 0;
+            // fährt zur Bildmitte hin heraus
+            bool mouthRight = side < 0;
+            OpenPipe(float.IsNaN(nearX) ? (side < 0 ? 200f * S : W - 200f * S) : nearX, mouthRight);
+            r.Dir = mouthRight ? 1 : -1;
+            r.X = mouthRight ? pipeX - RF - 2f * S : pipeX + RF + 2f * S;
+            r.Yb = ground.Top(r.X);
+            r.State = Robot.Exit;
+        }
+
+        public void ClosePipe() { if (pipeState == 1) pipeCloseT = 0.6f; }
 
         // ---- Oberflächen aus Fenster-/Icon-Liste aktualisieren
 
@@ -1165,8 +1700,8 @@ namespace Snowglobe
                 var w = wins[i];
                 if (!w.Surface) continue;
                 int y = w.R.Top - B.Top;
-                int x0 = Math.Max(0, w.R.Left - B.Left + 1);
-                int x1 = Math.Min(W, w.R.Right - B.Left - 1);
+                int x0 = Math.Max(0, w.R.Left - B.Left);
+                int x1 = Math.Min(W, w.R.Right - B.Left);
                 if (y < 24 * S || y >= workBottom - 4 || x1 - x0 < 40) continue;
                 Upsert(w.H.ToInt64(), 1, x0, x1, y, 14f * S, i, oldVis);
             }
@@ -1215,9 +1750,14 @@ namespace Snowglobe
                     float add = Math.Min(h, Math.Max(0f, t.Cap2[tc] - t.H[tc]));
                     t.H[tc] += add;
                     if (t.H[tc] > t.Peak) t.Peak = t.H[tc];
-                    if (h - add > 0.2f) Spill(x, t.Y - t.H[tc] - 1, h - add, 0, -20 * S);
+                    if (h - add > 0.2f) Spill(x, t.Base(tc) - t.H[tc] - 1, h - add, 0, -20 * S);
                 }
             }
+        }
+
+        Surface NewSurface(long key, int kind, int x0, int x1, int y, float maxH)
+        {
+            return new Surface(key, kind, x0, x1, y, maxH, true, 2.5f, kind == 1 ? 8f * S : 0f);
         }
 
         void Upsert(long key, int kind, int x0, int x1, int y, float maxH, int z, Dictionary<Surface, bool[]> oldVis)
@@ -1231,7 +1771,7 @@ namespace Snowglobe
                 if (s.X0 == x0 && s.X1 == x1)
                 {
                     // nur vertikal bewegt (z.B. Popup klappt auf): Schnee fährt mit
-                    var n = new Surface(key, kind, x0, x1, y, maxH, true);
+                    var n = NewSurface(key, kind, x0, x1, y, maxH);
                     for (int j = 0; j < n.N; j++) n.H[j] = Math.Min(n.Cap2[j], s.H[j]);
                     n.Peak = s.Peak; n.Z = z; n.Seen = true;
                     bool[] ov;
@@ -1244,7 +1784,7 @@ namespace Snowglobe
                 Release(s);
                 oldVis.Remove(s);
             }
-            s = new Surface(key, kind, x0, x1, y, maxH, true);
+            s = NewSurface(key, kind, x0, x1, y, maxH);
             s.Z = z; s.Seen = true;
             surfs.Add(s);
             map[key] = s;
@@ -1273,7 +1813,7 @@ namespace Snowglobe
                         if (s.Cover[j] < 0) s.Cover[j] = i;
                     }
                 }
-                else if (oy1 <= line && oy1 > s.Y - s.MaxH * 2.5f - 2)
+                else if (oy1 <= line && oy1 > s.Y - s.MaxH * 4f - 2)
                 {
                     for (int x = a; x < b; x++)
                         if (s.ClipY[x - s.X0] < oy1) s.ClipY[x - s.X0] = oy1;
@@ -1281,26 +1821,25 @@ namespace Snowglobe
             }
         }
 
-        // Schnee eines verschwundenen/bewegten Fensters fällt herunter.
+        // Schnee eines verschwundenen/bewegten Fensters fällt herunter: die obere Schicht
+        // bröckelt zuerst ab, unten liegende Klumpen folgen kurz danach.
         void Release(Surface s)
         {
             if (s.Peak <= 0.3f) return;
+            float vx0 = wind * 0.5f;
             for (int i = 0; i < s.N; i += 2)
             {
                 if (!s.Vis[i]) continue;
                 float h = s.H[i];
-                int k = (int)(h / (2.2f * S) + Rnd());
-                for (int j = 0; j < k && ndb < db.Length; j++)
+                int k = (int)(h / (3.2f * S) + Rnd());
+                float bse = s.Base(i);
+                for (int j = 0; j < k; j++)
                 {
-                    Debris d;
-                    d.X = s.X0 + i + Rnd() * 2f;
-                    d.Y = s.Y - Rnd() * h;
-                    d.Vx = (Rnd() - 0.5f) * 40f * S;
-                    d.Vy = Rnd() * 30f * S;
-                    d.R = (0.8f + Rnd() * 0.9f) * S;
-                    d.Alpha = 0.85f + 0.15f * Rnd();
-                    d.Cls = Sprites.ClassFor(d.R);
-                    db[ndb++] = d;
+                    float depth = Rnd();                          // 0 = Oberfläche, 1 = ganz unten
+                    bool clump = Rnd() < 0.3f + 0.4f * depth;
+                    AddDebris(s.X0 + i + Rnd() * 2f, bse - h + depth * h,
+                              vx0 + (Rnd() - 0.5f) * 36f * S, (Rnd() * 30f - 8f) * S,
+                              depth * 0.14f + Rnd() * 0.1f, clump);
                 }
             }
         }
@@ -1324,14 +1863,16 @@ namespace Snowglobe
         {
             uint* bits = Ov.Bits;
             // vorherigen Frame nur dort löschen, wo gezeichnet wurde
-            for (int k = 0; k < dirtyPrev.Count; k++)
+            for (int k = 0; k < dirty.Count; k++)
             {
-                Rectangle r = dirtyPrev[k];
+                Rectangle r = dirty[k];
                 int x0 = Math.Max(0, r.X), x1 = Math.Min(W, r.Right), y0 = Math.Max(0, r.Y), y1 = Math.Min(Hh, r.Bottom);
+                if (x1 <= x0) continue;
                 for (int y = y0; y < y1; y++)
                 {
                     uint* p = bits + (long)y * W + x0;
-                    for (int x = x0; x < x1; x++) *p++ = 0;
+                    uint* e = p + (x1 - x0);
+                    while (p < e) *p++ = 0;
                 }
             }
             var tmp = dirtyPrev; dirtyPrev = dirty; dirty = tmp; dirty.Clear();
@@ -1339,11 +1880,11 @@ namespace Snowglobe
             for (int k = 0; k < surfs.Count; k++) DrawPile(bits, surfs[k]);
             for (int i = 0; i < ndb; i++) Blit(bits, db[i].X, db[i].Y, db[i].Cls, db[i].Alpha);
             for (int i = 0; i < nfl; i++) Blit(bits, fl[i].X, fl[i].Y, fl[i].Cls, fl[i].Alpha);
+            if (ShovelParked) DrawArt(bits, shovelStand, (int)ParkX, (int)(ground.Top(ParkX) + 4f * S), int.MaxValue);
             if (Bot != null && RobotVisible()) DrawRobot(bits);
+            if (pipeState != 0) DrawPipe(bits);
             if (ShovelOn) DrawShovel(bits);
-            if (MarkerOn) DrawArt(bits, markerArt, (int)mkX, (int)mkY);
-
-            Ov.Present();
+            if (MarkerOn) DrawArt(bits, markerArt, (int)mkX, (int)mkY, int.MaxValue);
         }
 
         void DrawRobot(uint* bits)
@@ -1352,18 +1893,26 @@ namespace Snowglobe
             int frame = ((int)(b.Anim / (3f * S))) & 1;
             var a = robotArt[(b.Dir > 0 ? 0 : 4) + (b.Blade ? 2 : 0) + frame];
             int x = (int)Math.Round(b.X), y = (int)Math.Round(b.Yb);
-            DrawArt(bits, a, x, y);
-            bool busy = b.Busy;
-            float period = busy ? 0.5f : 1.6f;
+            DrawArt(bits, a, x, y, int.MaxValue);
+            float period = b.Busy ? 0.5f : 1.6f;
             if ((b.Blink % period) < period * 0.35f)
-                DrawArt(bits, busy ? lampAmber : lampRed, x - a.AX + (int)a.LX, y - a.AY + (int)a.LY);
+                DrawArt(bits, b.Busy ? lampAmber : lampRed, x - a.AX + (int)a.LX, y - a.AY + (int)a.LY, int.MaxValue);
+        }
+
+        void DrawPipe(uint* bits)
+        {
+            var a = pipeArt[pipeMouthRight ? 1 : 0];
+            float e = pipeAnim * pipeAnim * (3f - 2f * pipeAnim);
+            int gy = ground.Y;
+            int y = gy + (int)((1f - e) * a.H);
+            DrawArt(bits, a, (int)pipeX, y, gy);   // wächst aus dem Boden
         }
 
         void DrawShovel(uint* bits)
         {
             var a = shovelArt[shDir > 0 ? 0 : 1];
             int x = (int)Math.Round(shX), y = (int)Math.Round(shY);
-            DrawArt(bits, a, x, y);
+            DrawArt(bits, a, x, y, int.MaxValue);
             if (shLoad > 1f)
             {
                 // Schnee auf dem Schaufelblatt
@@ -1391,28 +1940,30 @@ namespace Snowglobe
             }
         }
 
-        void DrawArt(uint* bits, Art a, int x, int y)
+        void DrawArt(uint* bits, Art a, int x, int y, int clipBottom)
         {
-            Blend(bits, a.Px, a.W, a.H, x - a.AX, y - a.AY, 256);
+            Blend(bits, a.Px, a.W, a.H, x - a.AX, y - a.AY, 256, clipBottom);
         }
 
         void DrawPile(uint* bits, Surface s)
         {
             if (s.Peak < 0.15f) return;
-            int maxY = Math.Min(Hh, s.Y);
             for (int i = 0; i < s.N; i++)
             {
                 if (!s.Vis[i]) continue;
                 float h = s.H[i];
                 if (h < 0.15f) continue;
                 int x = s.X0 + i;
-                float top = s.Y - h;
+                float bse = s.Y + (int)(s.Off[i] + 0.5f);
+                int maxY = Math.Min(Hh, (int)bse);
+                float top = bse - h;
                 int y0 = (int)Math.Floor(top);
                 int yc = (int)Math.Ceiling(s.ClipY[i]);
                 if (y0 < yc) y0 = yc;
                 if (y0 < 0) y0 = 0;
                 uint hsh = (uint)x * 2654435761u;
                 int tex = (int)((hsh >> 27) & 7) - 3;
+                float invH = 1f / Math.Max(h, 1f);
                 // weicher Schatten über der Oberkante: Kontur auf hellem Hintergrund
                 int ys = (int)Math.Floor(top) - 1;
                 if (ys >= 0 && ys >= yc && ys < maxY)
@@ -1422,23 +1973,24 @@ namespace Snowglobe
                     if (a > 0 && bits[(long)ys * W + x] == 0)
                         bits[(long)ys * W + x] = ((uint)a << 24) | ((uint)(70 * a / 255) << 16) | ((uint)(80 * a / 255) << 8) | (uint)(100 * a / 255);
                 }
-                for (int y = y0; y < maxY; y++)
+                uint* p = bits + (long)y0 * W + x;
+                for (int y = y0; y < maxY; y++, p += W)
                 {
                     float cov = y + 1 - top;
                     if (cov <= 0f) continue;
                     if (cov > 1f) cov = 1f;
-                    float d = (y + 0.5f - top) / Math.Max(h, 1f);
+                    float d = (y + 0.5f - top) * invH;
                     if (d < 0f) d = 0f; else if (d > 1f) d = 1f;
                     float sh = d * d;
                     int cr = 255 - (int)(44 * sh) + tex, cg = 255 - (int)(32 * sh) + tex, cb = 255 - (int)(12 * sh);
-                    if (y == s.Y - 1 && h > 1.5f) { cr -= 18; cg -= 14; cb -= 6; }
+                    if (y == maxY - 1 && h > 1.5f) { cr -= 18; cg -= 14; cb -= 6; }
                     if (cr > 255) cr = 255; if (cg > 255) cg = 255; if (cb > 255) cb = 255;
                     int al = (int)(cov * 245f);
-                    bits[(long)y * W + x] = ((uint)al << 24) | ((uint)(cr * al / 255) << 16) | ((uint)(cg * al / 255) << 8) | (uint)(cb * al / 255);
+                    *p = ((uint)al << 24) | ((uint)(cr * al / 255) << 16) | ((uint)(cg * al / 255) << 8) | (uint)(cb * al / 255);
                 }
             }
             int ry = (int)(s.Y - s.Peak) - 2;
-            dirty.Add(new Rectangle(s.X0, ry, s.N, s.Y - ry));
+            dirty.Add(new Rectangle(s.X0, ry, s.N, s.Y + 10 - ry));
         }
 
         void Blit(uint* bits, float fx, float fy, int cls, float alpha)
@@ -1447,56 +1999,68 @@ namespace Snowglobe
             int sx = (int)((fx - ix) * 4f), sy = (int)((fy - iy) * 4f);
             if (sx > 3) sx = 3; if (sy > 3) sy = 3;
             int S2 = Sprites.Size[cls], off = Sprites.Off[cls];
-            Blend(bits, Sprites.Data[cls * 16 + sy * 4 + sx], S2, S2, ix - off, iy - off, (int)(alpha * 256f));
+            Blend(bits, Sprites.Data[cls * 16 + sy * 4 + sx], S2, S2, ix - off, iy - off, (int)(alpha * 256f), int.MaxValue);
         }
 
         // premultiplied "over"-Blending eines Sprites in den Puffer
-        void Blend(uint* bits, uint[] spr, int sw, int sh, int dx, int dy, int al)
+        void Blend(uint* bits, uint[] spr, int sw, int sh, int dx, int dy, int al, int clipBottom)
         {
-            if (dx >= W || dy >= Hh || dx + sw <= 0 || dy + sh <= 0) return;
+            int maxY = Math.Min(Hh, clipBottom);
+            if (dx >= W || dy >= maxY || dx + sw <= 0 || dy + sh <= 0) return;
             int px0 = Math.Max(0, -dx), py0 = Math.Max(0, -dy);
-            int px1 = Math.Min(sw, W - dx), py1 = Math.Min(sh, Hh - dy);
-            for (int py = py0; py < py1; py++)
+            int px1 = Math.Min(sw, W - dx), py1 = Math.Min(sh, maxY - dy);
+            fixed (uint* sp = spr)
             {
-                uint* row = bits + (long)(dy + py) * W + dx;
-                int so = py * sw;
-                for (int px = px0; px < px1; px++)
+                for (int py = py0; py < py1; py++)
                 {
-                    uint s = spr[so + px];
-                    int a = (int)(s >> 24) * al >> 8;
-                    if (a == 0) continue;
-                    int sr = (int)((s >> 16) & 255) * al >> 8, sg = (int)((s >> 8) & 255) * al >> 8, sb = (int)(s & 255) * al >> 8;
-                    uint d = row[px];
-                    if (d == 0 || a >= 255)
+                    uint* row = bits + (long)(dy + py) * W + dx;
+                    uint* src = sp + py * sw;
+                    for (int px = px0; px < px1; px++)
                     {
-                        row[px] = ((uint)a << 24) | ((uint)sr << 16) | ((uint)sg << 8) | (uint)sb;
-                    }
-                    else
-                    {
-                        int ia = 255 - a;
-                        uint na = (uint)(a + (((int)(d >> 24) * ia) >> 8));
-                        uint nr = (uint)(sr + (((int)((d >> 16) & 255) * ia) >> 8));
-                        uint ng = (uint)(sg + (((int)((d >> 8) & 255) * ia) >> 8));
-                        uint nb = (uint)(sb + (((int)(d & 255) * ia) >> 8));
-                        if (na > 255) na = 255;
-                        if (nr > na) nr = na; if (ng > na) ng = na; if (nb > na) nb = na;
-                        row[px] = (na << 24) | (nr << 16) | (ng << 8) | nb;
+                        uint s = src[px];
+                        if (s == 0) continue;
+                        int a = (int)(s >> 24) * al >> 8;
+                        if (a == 0) continue;
+                        int sr = (int)((s >> 16) & 255) * al >> 8, sg = (int)((s >> 8) & 255) * al >> 8, sb = (int)(s & 255) * al >> 8;
+                        uint d = row[px];
+                        if (d == 0 || a >= 255)
+                        {
+                            row[px] = ((uint)a << 24) | ((uint)sr << 16) | ((uint)sg << 8) | (uint)sb;
+                        }
+                        else
+                        {
+                            int ia = 255 - a;
+                            uint na = (uint)(a + (((int)(d >> 24) * ia) >> 8));
+                            uint nr = (uint)(sr + (((int)((d >> 16) & 255) * ia) >> 8));
+                            uint ng = (uint)(sg + (((int)((d >> 8) & 255) * ia) >> 8));
+                            uint nb = (uint)(sb + (((int)(d & 255) * ia) >> 8));
+                            if (na > 255) na = 255;
+                            if (nr > na) nr = na; if (ng > na) ng = na; if (nb > na) nb = na;
+                            row[px] = (na << 24) | (nr << 16) | (ng << 8) | nb;
+                        }
                     }
                 }
             }
             dirty.Add(new Rectangle(dx, dy, sw, sh));
         }
 
+        // Rechtecke, die im letzten Render() gezeichnet wurden (für die Teil-Aktualisierung)
+        public List<Rectangle> Drawn { get { return dirty; } }
+
         public void ClearAll()
         {
             Ov.Clear();
-            Ov.Present();
             dirty.Clear(); dirtyPrev.Clear();
+            Ov.Present(dirty);
         }
 
         public void Dispose() { Ov.Dispose(); }
 
-        // ---- Selbsttest (--selftest): prüft Popup-Schieben, Schaufel und Roboter ohne echte Fenster
+        // ---- Selbsttest (--selftest): prüft Popup-Schieben, Schaufel, Roboter und Röhre ohne echte Fenster
+
+        static string Ok(bool b) { return b ? "OK" : "FEHLER"; }
+
+        void StepN(int frames) { for (int k = 0; k < frames; k++) Step(1f / 30f, k / 30f); }
 
         public static string SelfTest()
         {
@@ -1514,53 +2078,56 @@ namespace Snowglobe
             w.UpdateSurfaces(none, fresh, icons, 0, 48);
             var pop = new WinInfo(); pop.H = new IntPtr(4242); pop.Surface = true;
             pop.R.Left = 1000; pop.R.Top = 880; pop.R.Right = 1400; pop.R.Bottom = 1080;
-            var wl = new List<WinInfo> { pop };
             fresh.Add(pop.H);
-            w.UpdateSurfaces(wl, fresh, icons, 0, 48);
+            w.UpdateSurfaces(new List<WinInfo> { pop }, fresh, icons, 0, 48);
             Surface ps;
             w.map.TryGetValue(4242, out ps);
             float onPopup = ps != null ? ps.Sum(0, ps.N) : -1, leftOnGround = g.Sum(1001, 1399);
-            sb.AppendLine(string.Format("Popup: Schnee auf Popup = {0:F0} px², unter Popup am Boden = {1:F0} px²  -> {2}",
-                onPopup, leftOnGround, onPopup > 3500 && leftOnGround < 1 ? "OK" : "FEHLER"));
+            sb.AppendLine(string.Format("Popup: Schnee auf Popup = {0:F0} px², unter Popup am Boden = {1:F0} px² -> {2}", onPopup, leftOnGround, Ok(onPopup > 3500 && leftOnGround < 1)));
+            sb.AppendLine(string.Format("  Ecke: Kante bei Spalte 0 um {0:F1} px abgesenkt, Spalte 20 um {1:F1} px -> {2}", ps.Off[0], ps.Off[20], Ok(ps.Off[0] > 4 && ps.Off[20] == 0)));
             fresh.Clear();
             w.UpdateSurfaces(none, fresh, icons, 0, 48);
-            sb.AppendLine(string.Format("Popup zu: {0} Brocken fallen herunter -> {1}", w.ndb, w.ndb > 100 ? "OK" : "FEHLER"));
-            for (int k = 0; k < 120; k++) w.Step(1f / 30f, k / 30f);
-            sb.AppendLine(string.Format("  nach 4 s: am Boden unter dem Popup wieder {0:F0} px² -> {1}", g.Sum(990, 1410), g.Sum(990, 1410) > 1500 ? "OK" : "FEHLER"));
+            int n0 = w.ndb;
+            w.StepN(3);
+            int still = 0;
+            for (int i = 0; i < w.ndb; i++) if (w.db[i].Delay > 0) still++;
+            sb.AppendLine(string.Format("Popup zu: {0} Brocken, nach 0,1 s noch {1} gestaffelt in Wartestellung -> {2}", n0, still, Ok(n0 > 100 && still > 0 && still < n0)));
+            w.StepN(120);
+            sb.AppendLine(string.Format("  nach 4 s: am Boden unter dem Popup wieder {0:F0} px² -> {1}", g.Sum(990, 1410), Ok(g.Sum(990, 1410) > 1500)));
 
             // 2) Schaufel schiebt Schnee nach rechts
             Array.Clear(g.H, 0, g.N); w.ndb = 0;
             for (int j = 300; j < 700; j++) g.H[j] = 6f;
             g.Peak = 6f;
-            float load = 0, before = g.Sum(0, g.N);
+            float load = 0;
             float y = g.Y - 1;
             for (int x = 290; x <= 720; x += 6) w.ShovelStep(x, y, x - 6, y, true, ref load);
             float cleared = g.Sum(320, 690);
-            sb.AppendLine(string.Format("Schaufel: Rest auf der Strecke = {0:F0} px², vorne aufgehäuft = {1:F0} px², auf Schaufel = {2:F0} px² -> {3}",
-                cleared, g.Sum(700, 900), load, cleared < 300 && g.Sum(700, 900) + load > 1500 ? "OK" : "FEHLER"));
+            sb.AppendLine(string.Format("Schaufel: Rest auf der Strecke = {0:F0} px², vorne + auf Schaufel = {1:F0} px² -> {2}",
+                cleared, g.Sum(700, 900) + load, Ok(cleared < 50 && g.Sum(700, 900) + load > 2000)));
             w.ShovelStep(720, 900, 720, y, true, ref load);
             float carried = load;
             w.DropLoad(720, 900, ref load, 200, -100);
-            sb.AppendLine(string.Format("  hochgehoben {0:F0} px², geworfen als {1} Brocken -> {2}", carried, w.ndb, carried > 50 && w.ndb > 10 ? "OK" : "FEHLER"));
+            sb.AppendLine(string.Format("  hochgehoben {0:F0} px², geworfen als {1} Brocken -> {2}", carried, w.ndb, Ok(carried > 50 && w.ndb > 10)));
 
-            // 3) Roboter räumt den Boden zu einem Haufen
+            // 3) Roboter räumt den Boden zu Haufen an beiden Rändern
             Array.Clear(g.H, 0, g.N); w.ndb = 0;
             var rnd = new Random(3);
             for (int j = 0; j < g.N; j++) g.H[j] = 3f + (float)rnd.NextDouble() * 2f;
             g.Peak = 5f;
             var r = new Robot();
             w.RobotPlace(r);
-            r.X = 900;
+            r.X = 700;
             float total = g.Sum(0, g.N);
             w.Poke();
             int steps = 0;
-            for (; steps < 30 * 120; steps++) { w.Step(1f / 30f, steps / 30f); if (steps > 30 && r.State == Robot.Idle) break; }
-            float nearHeap = g.Sum(900 - 250, 900 + 250), all = g.Sum(0, g.N);
-            sb.AppendLine(string.Format("Roboter: fertig nach {0:F1} s, {1:P0} des Schnees im Haufen um x=900 (max. Höhe {2:F0} px) -> {3}",
-                steps / 30f, nearHeap / Math.Max(1f, all), g.Peak, nearHeap / Math.Max(1f, all) > 0.85f && r.State == Robot.Idle ? "OK" : "FEHLER"));
-            sb.AppendLine(string.Format("  Schnee vorher {0:F0} px², nachher {1:F0} px² (Tauen/Brocken eingerechnet)", total, all));
+            for (; steps < 30 * 180; steps++) { w.Step(1f / 30f, steps / 30f); if (steps > 30 && r.State == Robot.Idle) break; }
+            float leftHeap = g.Sum(0, 300), rightHeap = g.Sum(g.N - 300, g.N), all = g.Sum(0, g.N);
+            sb.AppendLine(string.Format("Roboter: fertig nach {0:F1} s, links {1:P0} / rechts {2:P0} des Schnees am Rand, Haufenhöhe {3:F0} px -> {4}",
+                steps / 30f, leftHeap / all, rightHeap / all, g.Peak, Ok((leftHeap + rightHeap) / all > 0.9f && leftHeap > 0.3f * all && rightHeap > 0.3f * all)));
+            sb.AppendLine(string.Format("  Schnee vorher {0:F0} px², nachher {1:F0} px²", total, all));
 
-            // 4) Roboter auf einem Fenster schiebt den Schnee über die Kante
+            // 4) Roboter auf einem Fenster schiebt den Schnee über beide Kanten
             var win = new WinInfo(); win.H = new IntPtr(777); win.Surface = true;
             win.R.Left = 400; win.R.Top = 300; win.R.Right = 1000; win.R.Bottom = 700;
             w.UpdateSurfaces(new List<WinInfo> { win }, fresh, icons, 0, 48);
@@ -1571,9 +2138,22 @@ namespace Snowglobe
             r.Surf = ws; r.X = 700; r.Yb = ws.Y; r.State = Robot.Idle;
             w.Poke();
             for (steps = 0; steps < 30 * 60; steps++) { w.Step(1f / 30f, steps / 30f); if (steps > 30 && r.State == Robot.Idle) break; }
-            sb.AppendLine(string.Format("Roboter auf Fenster: Rest {0:F0} px² von {1:F0} -> {2}", ws.Sum(0, ws.N), 4f * ws.N, ws.Sum(0, ws.N) < 0.1f * 4f * ws.N ? "OK" : "FEHLER"));
+            sb.AppendLine(string.Format("Roboter auf Fenster: Rest {0:F0} px² von {1:F0} -> {2}", ws.Sum(0, ws.N), 4f * ws.N, Ok(ws.Sum(0, ws.N) < 0.1f * 4f * ws.N)));
 
-            w.Dispose();
+            // 5) Röhre: Roboter wechselt auf einen zweiten Monitor
+            w.UpdateSurfaces(none, fresh, icons, 0, 48);
+            r.Surf = g; r.X = 800; r.Yb = g.Y; r.State = Robot.Idle;
+            var w2 = new World(new Rectangle(1920, 0, 1920, 1080), new Rectangle(1920, 0, 1920, 1080), 1f, 2);
+            w.SendAway(1);
+            for (steps = 0; steps < 30 * 20 && !w.RobotGone; steps++) w.Step(1f / 30f, steps / 30f);
+            bool gone = w.RobotGone;
+            w.Bot = null; w.ClosePipe();
+            w2.Receive(r, -1, float.NaN);
+            for (steps = 0; steps < 30 * 20 && r.State != Robot.Idle; steps++) w2.Step(1f / 30f, steps / 30f);
+            sb.AppendLine(string.Format("Röhre: hineingefahren = {0}, auf Monitor 2 herausgekommen = {1} (x={2:F0}) -> {3}",
+                gone, r.State == Robot.Idle, r.X, Ok(gone && r.State == Robot.Idle && r.Surf == w2.ground)));
+
+            w.Dispose(); w2.Dispose();
             return sb.ToString();
         }
     }
@@ -1636,18 +2216,19 @@ namespace Snowglobe
 
     // ------------------------------------------------------------ Maus-Hook
 
-    struct HookEvt { public int Kind; public POINT Pt; }   // 1 Roboter angeklickt, 2 Ziel gewählt, 3 Werkzeug beenden
+    // 1 Roboter angeklickt, 2 Ziel gewählt, 3 Werkzeug beenden, 4 Schaufel aufgenommen
+    struct HookEvt { public int Kind; public POINT Pt; }
 
     // Low-Level-Maushook auf eigenem Thread, damit der Cursor nie auf die Render-Schleife wartet.
     sealed class MouseHook
     {
         public volatile int Tool;            // 0 keins, 1 Schaufel, 2 Roboter hinschicken
         public volatile bool LeftDown;
-        public volatile bool RobotNeedsDesktop;
+        public volatile bool NeedsDesktop;
         public readonly ConcurrentQueue<HookEvt> Events = new ConcurrentQueue<HookEvt>();
         readonly object lk = new object();
-        Rectangle robotRect;
-        bool robotActive, swallowLUp, swallowRUp;
+        Rectangle robotRect, shovelRect;
+        bool robotActive, shovelActive, swallowLUp, swallowRUp;
         Thread th;
         uint tid;
         N.LLProc proc;
@@ -1655,9 +2236,9 @@ namespace Snowglobe
 
         public bool Running { get { return th != null; } }
 
-        public void SetRobot(Rectangle r, bool active)
+        public void SetTargets(Rectangle robot, bool robotOn, Rectangle shovel, bool shovelOn)
         {
-            lock (lk) { robotRect = r; robotActive = active; }
+            lock (lk) { robotRect = robot; robotActive = robotOn; shovelRect = shovel; shovelActive = shovelOn; }
         }
 
         public void Start()
@@ -1704,7 +2285,8 @@ namespace Snowglobe
                         case 0x0201: // LBUTTONDOWN
                             if (tool == 1) { LeftDown = true; return new IntPtr(1); }
                             if (tool == 2) { Enqueue(2, info.pt); swallowLUp = true; return new IntPtr(1); }
-                            if (HitRobot(info.pt)) { Enqueue(1, info.pt); swallowLUp = true; return new IntPtr(1); }
+                            if (Hit(info.pt, true)) { Tool = 1; LeftDown = true; Enqueue(4, info.pt); return new IntPtr(1); }
+                            if (Hit(info.pt, false)) { Enqueue(1, info.pt); swallowLUp = true; return new IntPtr(1); }
                             break;
                         case 0x0202: // LBUTTONUP
                             if (tool == 1) { LeftDown = false; return new IntPtr(1); }
@@ -1728,13 +2310,13 @@ namespace Snowglobe
             Events.Enqueue(e);
         }
 
-        bool HitRobot(POINT p)
+        bool Hit(POINT p, bool shovel)
         {
             lock (lk)
             {
-                if (!robotActive || !robotRect.Contains(p.X, p.Y)) return false;
+                if (shovel ? (!shovelActive || !shovelRect.Contains(p.X, p.Y)) : (!robotActive || !robotRect.Contains(p.X, p.Y))) return false;
             }
-            if (RobotNeedsDesktop)
+            if (NeedsDesktop)
             {
                 string c = N.ClassOf(N.GetAncestor(N.WindowFromPoint(p), 2));
                 if (c != "Progman" && c != "WorkerW") return false;
@@ -1764,9 +2346,107 @@ namespace Snowglobe
 
         public void Dispose()
         {
-            N.UnregisterHotKey(Handle, 1);
             N.UnregisterHotKey(Handle, 2);
             DestroyHandle();
+        }
+    }
+
+    // ------------------------------------------------------------ Updates
+
+    // Prüft GitHub-Releases. Ein Release braucht die Assets "Snowglobe.exe" und "Snowglobe.exe.sha256".
+    static class Updater
+    {
+        public const string Repo = "JRSDev-at/snowglobe";
+
+        public static Version Current
+        {
+            get { var v = Assembly.GetExecutingAssembly().GetName().Version; return new Version(v.Major, v.Minor, v.Build); }
+        }
+
+        public static string ExePath { get { return Application.ExecutablePath; } }
+
+        // Läuft im Hintergrund. Gibt bei Erfolg den Pfad der heruntergeladenen, geprüften neuen Version zurück.
+        public static string Check(out string message, out Version found)
+        {
+            found = null;
+            message = null;
+            ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2
+            var json = Get("https://api.github.com/repos/" + Repo + "/releases/latest");
+            if (json == null) { message = "Update-Server nicht erreichbar (ist das Repository öffentlich?)"; return null; }
+            var rel = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+            string tag = Convert.ToString(rel["tag_name"]).TrimStart('v', 'V');
+            Version v;
+            if (!Version.TryParse(tag, out v)) { message = "Unbekanntes Versionsformat: " + tag; return null; }
+            v = new Version(v.Major, v.Minor, Math.Max(0, v.Build));
+            found = v;
+            if (v <= Current) { message = "Snowglobe " + Current + " ist aktuell."; return null; }
+
+            string exeUrl = null, shaUrl = null;
+            var assets = rel["assets"] as System.Collections.ArrayList;
+            if (assets != null)
+                foreach (Dictionary<string, object> a in assets)
+                {
+                    string name = Convert.ToString(a["name"]);
+                    if (name == "Snowglobe.exe") exeUrl = Convert.ToString(a["browser_download_url"]);
+                    if (name == "Snowglobe.exe.sha256") shaUrl = Convert.ToString(a["browser_download_url"]);
+                }
+            if (exeUrl == null || shaUrl == null) { message = "Release " + v + " hat keine Snowglobe.exe + Prüfsumme."; return null; }
+
+            string target = Path.Combine(Path.GetDirectoryName(ExePath), "Snowglobe.new.exe");
+            using (var wc = new WebClient())
+            {
+                wc.Headers[HttpRequestHeader.UserAgent] = "Snowglobe-Updater";
+                string sha = wc.DownloadString(shaUrl).Trim().Split(' ', '\t', '\r', '\n')[0].ToLowerInvariant();
+                wc.DownloadFile(exeUrl, target);
+                string actual;
+                using (var f = File.OpenRead(target))
+                using (var h = SHA256.Create())
+                    actual = BitConverter.ToString(h.ComputeHash(f)).Replace("-", "").ToLowerInvariant();
+                if (actual != sha) { File.Delete(target); message = "Prüfsumme des Updates stimmt nicht – verworfen."; return null; }
+            }
+            var nv = AssemblyName.GetAssemblyName(target).Version;
+            if (nv.Major != v.Major || nv.Minor != v.Minor || nv.Build != v.Build) { File.Delete(target); message = "Versionsnummer im Update passt nicht – verworfen."; return null; }
+            message = "Snowglobe " + v + " wird installiert …";
+            return target;
+        }
+
+        static string Get(string url)
+        {
+            try
+            {
+                var req = (HttpWebRequest)WebRequest.Create(url);
+                req.UserAgent = "Snowglobe-Updater";
+                req.Accept = "application/vnd.github+json";
+                req.Timeout = 15000;
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    return sr.ReadToEnd();
+            }
+            catch { return null; }
+        }
+
+        // Laufende EXE umbenennen (unter Windows erlaubt), neue an ihre Stelle, neu starten.
+        public static bool Install(string newExe)
+        {
+            string exe = ExePath, old = exe + ".old";
+            try
+            {
+                if (File.Exists(old)) File.Delete(old);
+                File.Move(exe, old);
+                File.Move(newExe, exe);
+                Process.Start(exe, "--updated");
+                return true;
+            }
+            catch
+            {
+                try { if (!File.Exists(exe) && File.Exists(old)) File.Move(old, exe); } catch { }
+                return false;
+            }
+        }
+
+        public static void Cleanup()
+        {
+            try { string old = ExePath + ".old"; if (File.Exists(old)) File.Delete(old); } catch { }
         }
     }
 
@@ -1788,25 +2468,32 @@ namespace Snowglobe
         readonly MouseHook hook = new MouseHook();
         readonly HotkeyWindow hotkeys = new HotkeyWindow();
         readonly Robot robot = new Robot();
+        readonly SynchronizationContext ui;
+        readonly Dictionary<IntPtr, string> classCache = new Dictionary<IntPtr, string>();
+        readonly Dictionary<IntPtr, int[]> insets = new Dictionary<IntPtr, int[]>();
+        readonly Dictionary<IntPtr, double> insetTime = new Dictionary<IntPtr, double>();
         List<WinInfo> wins = new List<WinInfo>(), scan = new List<WinInfo>();
         HashSet<IntPtr> fresh = new HashSet<IntPtr>();
         List<RECT> icons = new List<RECT>();
         long winSig, iconSig;
         float iconTopOffset, iconSizePx = 48f;
-        double last;
+        double last, nextUpdateCheck;
         int frame, density, tool;
-        bool paused, locked, excludeCapture, background, robotShown, needSurfaceUpdate = true;
+        bool paused, locked, excludeCapture, background, robotShown, shovelShown, autoUpdate, updating, needSurfaceUpdate = true, shovelTipShown;
         IntPtr deskHost;
         float shovelLoad;
         POINT prevCur;
         bool prevDown;
-        World robotWorld;
+        World robotWorld, shovelWorld;
         ToolStripMenuItem[] densityItems;
-        ToolStripMenuItem pauseItem, captureItem, autostartItem, backgroundItem, shovelItem, sendItem, robotShowItem, robotAutoItem;
+        ToolStripMenuItem pauseItem, captureItem, autostartItem, backgroundItem, shovelItem, sendItem, robotShowItem, robotAutoItem, updateItem;
         Icon trayIcon;
+        // Performance-Messung (--perf)
+        long tSim, tDraw, tPresent, tScan; int perfFrames;
 
-        public App(bool forceCapture)
+        public App(bool forceCapture, bool justUpdated)
         {
+            ui = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
             enumProc = EnumCallback;
             Sprites.Build();
             using (var k = Registry.CurrentUser.CreateSubKey(RegKey))
@@ -1815,6 +2502,8 @@ namespace Snowglobe
                 excludeCapture = Convert.ToInt32(k.GetValue("ExcludeFromCapture", 1)) != 0;
                 background = Convert.ToInt32(k.GetValue("Background", 0)) != 0;
                 robotShown = Convert.ToInt32(k.GetValue("Robot", 1)) != 0;
+                shovelShown = Convert.ToInt32(k.GetValue("Shovel", 0)) != 0;
+                autoUpdate = Convert.ToInt32(k.GetValue("AutoUpdate", 1)) != 0;
                 World.RobotAuto = Convert.ToInt32(k.GetValue("RobotAuto", 0)) != 0;
             }
             if (forceCapture) excludeCapture = false;
@@ -1824,12 +2513,15 @@ namespace Snowglobe
             BuildTray();
 
             hotkeys.Pressed = OnHotkey;
-            hotkeys.Register(1, 0x0002 | 0x0001, (uint)Keys.S); // Strg+Alt+S
-            hotkeys.Register(2, 0x0002 | 0x0001, (uint)Keys.R); // Strg+Alt+R
+            hotkeys.Register(2, 0x0002 | 0x0001, (uint)Keys.R); // Strg+Alt+R: Roboter hinschicken
             UpdateHook();
 
             SystemEvents.DisplaySettingsChanged += OnDisplayChanged;
             SystemEvents.SessionSwitch += OnSessionSwitch;
+
+            Updater.Cleanup();
+            if (justUpdated) tray.ShowBalloonTip(4000, "Snowglobe aktualisiert", "Jetzt auf Version " + Updater.Current + ".", ToolTipIcon.None);
+            nextUpdateCheck = 60;   // erste Prüfung eine Minute nach dem Start
 
             timer.Interval = 33;
             timer.Tick += delegate { Tick(); };
@@ -1840,7 +2532,7 @@ namespace Snowglobe
         {
             foreach (var w in worlds) w.Dispose();
             worlds.Clear(); own.Clear();
-            robotWorld = null;
+            robotWorld = null; shovelWorld = null;
             int seed = Environment.TickCount;
             foreach (var sc in Screen.AllScreens)
             {
@@ -1855,8 +2547,13 @@ namespace Snowglobe
                 if (!paused) w.Ov.SetShown(true);
                 own.Add(w.Ov.Handle);
                 worlds.Add(w);
-                if (sc.Primary && robotShown) { w.RobotPlace(robot); robotWorld = w; }
+                if (sc.Primary)
+                {
+                    shovelWorld = w;
+                    if (robotShown) { w.RobotPlace(robot); robotWorld = w; }
+                }
             }
+            if (shovelWorld == null) shovelWorld = worlds[0];
             winSig = 0; iconSig = 0; needSurfaceUpdate = true;
             ScanIcons();
             ApplyZOrder(true);
@@ -1876,6 +2573,13 @@ namespace Snowglobe
 
         // ---- Fenster scannen (Z-Reihenfolge, oben zuerst)
 
+        string CachedClass(IntPtr h)
+        {
+            string c;
+            if (!classCache.TryGetValue(h, out c)) { c = N.ClassOf(h); classCache[h] = c; }
+            return c;
+        }
+
         bool EnumCallback(IntPtr h, IntPtr l)
         {
             if (own.Contains(h) || !N.IsWindowVisible(h) || N.IsIconic(h)) return true;
@@ -1888,7 +2592,7 @@ namespace Snowglobe
                 uint key, fl; byte alpha;
                 if (N.GetLayeredWindowAttributes(h, out key, out alpha, out fl) && (fl & 2) != 0 && alpha == 0) return true;
             }
-            string cls = N.ClassOf(h);
+            string cls = CachedClass(h);
             if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd" || cls == "Shell_SecondaryTrayWnd") return true;
             RECT r;
             if (N.DwmGetWindowAttribute(h, 9, out r, 16) != 0) N.GetWindowRect(h, out r);
@@ -1903,9 +2607,24 @@ namespace Snowglobe
             }
             bool zoomed = N.IsZoomed(h);
             var wi = new WinInfo();
-            wi.H = h; wi.R = r;
+            wi.H = h;
             wi.Big = zoomed || full;
             wi.Surface = !wi.Big && w >= 80 && hh >= 40 && (st & 0x40000000) == 0 && cls != "tooltips_class32";
+            // Popups ohne Titelleiste haben oft einen unsichtbaren Rand: echte Kante am Bildschirm messen
+            if (wi.Surface && (st & 0x00C00000) != 0x00C00000)
+            {
+                int[] ins;
+                double now = sw.Elapsed.TotalSeconds, t0;
+                if (!insets.TryGetValue(h, out ins) || (insetTime.TryGetValue(h, out t0) && t0 > 0 && now - t0 > 0.4))
+                {
+                    ins = ScreenProbe.Inset(r);
+                    bool first = !insets.ContainsKey(h);
+                    insets[h] = ins;
+                    insetTime[h] = first ? now : -1;   // einmal nach der Öffnungs-Animation nachmessen
+                }
+                r.Left += ins[0]; r.Top += ins[1]; r.Right -= ins[2];
+            }
+            wi.R = r;
             scan.Add(wi);
             return true;
         }
@@ -1927,12 +2646,22 @@ namespace Snowglobe
             var prev = new Dictionary<IntPtr, RECT>();
             foreach (var w in wins) prev[w.H] = w.R;
             fresh.Clear();
+            var alive = new HashSet<IntPtr>();
             foreach (var w in scan)
             {
+                alive.Add(w.H);
                 RECT o;
                 if (!prev.TryGetValue(w.H, out o) || o.Left != w.R.Left || o.Top != w.R.Top || o.Right != w.R.Right || o.Bottom != w.R.Bottom)
                     fresh.Add(w.H);
             }
+            // Caches für geschlossene Fenster aufräumen
+            if (insets.Count > 0)
+            {
+                var dead = new List<IntPtr>();
+                foreach (var h in insets.Keys) if (!alive.Contains(h)) dead.Add(h);
+                foreach (var h in dead) { insets.Remove(h); insetTime.Remove(h); }
+            }
+            if (classCache.Count > 2000) classCache.Clear();
             var t = wins; wins = scan; scan = t;
             needSurfaceUpdate = true;
         }
@@ -1950,7 +2679,6 @@ namespace Snowglobe
             if (sig == iconSig) return;
             iconSig = sig;
             icons = list;
-            // Das Icon-Rechteck enthält oben etwas Rand; die Grafik selbst ist darin zentriert.
             float iconPx = 48f;
             try
             {
@@ -1984,7 +2712,6 @@ namespace Snowglobe
             }
             if (!force)
             {
-                // passt es noch? Alle Overlays müssen direkt über dem Desktop liegen.
                 int n = 0;
                 IntPtr h = N.GetWindow(deskHost, 3);
                 while (h != IntPtr.Zero && own.Contains(h)) { n++; h = N.GetWindow(h, 3); }
@@ -2001,9 +2728,11 @@ namespace Snowglobe
             float dt = (float)Math.Min(0.1, now - last);
             last = now;
             HandleHookEvents();
+            if (autoUpdate && !updating && now > nextUpdateCheck) { nextUpdateCheck = now + 6 * 3600; CheckForUpdate(false); }
             if (paused || locked) return;
             frame++;
 
+            long t0 = Stopwatch.GetTimestamp();
             if (frame % 3 == 0) ScanWindows();
             if (frame % 60 == 1) ScanIcons();
             if (needSurfaceUpdate)
@@ -2015,22 +2744,94 @@ namespace Snowglobe
             }
             if (frame % 15 == 0) CheckFullscreen();
             if (frame % 30 == 0) ApplyZOrder(false);
+            long t1 = Stopwatch.GetTimestamp();
 
             UpdateTools(dt);
+            UpdateRobotTravel();
+            foreach (var w in worlds) w.ShovelParked = shovelShown && tool != 1 && w == shovelWorld;
 
+            long tSimLocal = 0, tDrawLocal = 0, tPresLocal = 0;
             foreach (var w in worlds)
             {
                 if (w.Hidden || w.Covered) continue;
+                long a = Stopwatch.GetTimestamp();
                 w.Step(dt, (float)now);
+                long b = Stopwatch.GetTimestamp();
                 w.Render();
+                long c = Stopwatch.GetTimestamp();
+                w.Ov.Present(w.Drawn);
+                long d = Stopwatch.GetTimestamp();
+                tSimLocal += b - a; tDrawLocal += c - b; tPresLocal += d - c;
             }
 
             if (hook.Running)
             {
-                bool act = robotWorld != null && !robotWorld.Hidden && !robotWorld.Covered && robotWorld.RobotVisible();
-                hook.SetRobot(act ? robotWorld.RobotRect() : Rectangle.Empty, act);
-                hook.RobotNeedsDesktop = !WantTopmost;
+                bool rAct = robotWorld != null && !robotWorld.Hidden && !robotWorld.Covered && robotWorld.RobotVisible();
+                bool sAct = shovelShown && tool == 0 && shovelWorld != null && !shovelWorld.Hidden && !shovelWorld.Covered;
+                hook.SetTargets(rAct ? robotWorld.RobotRect() : Rectangle.Empty, rAct, sAct ? shovelWorld.ShovelParkRect() : Rectangle.Empty, sAct);
+                hook.NeedsDesktop = !WantTopmost;
             }
+
+            if (Program.Perf)
+            {
+                tScan += t1 - t0; tSim += tSimLocal; tDraw += tDrawLocal; tPresent += tPresLocal; perfFrames++;
+                if (perfFrames == 150)
+                {
+                    double f = 1000.0 / Stopwatch.Frequency / perfFrames;
+                    File.AppendAllText(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "perf.txt"),
+                        string.Format("{0:HH:mm:ss} ms/Frame: Scan {1:F2}  Simulation {2:F2}  Zeichnen {3:F2}  Present {4:F2}  GPU={5} Kacheln {6}/{7}\r\n", DateTime.Now, tScan * f, tSim * f, tDraw * f, tPresent * f,
+                            worlds[0].Ov.OnGpu, worlds[0].Ov.LastTiles, worlds[0].Ov.TotalTiles)
+                        + string.Format("    Map {0:F2}  Kopieren {1:F2}  DXGI-Present {2:F2}\r\n", Overlay.TGet * f, Overlay.TUpload * f, Overlay.TPresent * f));
+                    Overlay.TGet = Overlay.TUpload = Overlay.TPresent = 0;
+                    tScan = tSim = tDraw = tPresent = 0; perfFrames = 0;
+                }
+            }
+        }
+
+        // Roboter zwischen Monitoren: Röhre hinein, auf dem Ziel-Monitor wieder heraus.
+        void UpdateRobotTravel()
+        {
+            if (robotWorld == null) return;
+            if (robotWorld.RobotGone)
+            {
+                var src = robotWorld;
+                var tgt = robot.Target;
+                if (tgt == null || !worlds.Contains(tgt)) tgt = src;
+                src.RobotGone = false;
+                src.Bot = null;
+                src.ClosePipe();
+                int side = Math.Sign((tgt.B.X + tgt.B.Width / 2) - (src.B.X + src.B.Width / 2));
+                if (side == 0) side = 1;
+                tgt.Receive(robot, -side, robot.PendingSend ? robot.PendingX : float.NaN);
+                robot.Target = null;
+                robotWorld = tgt;
+                return;
+            }
+            if (robot.NoJob)
+            {
+                robot.NoJob = false;
+                if (!World.RobotAuto) return;
+                World best = null;
+                float bestScore = 0;
+                foreach (var w in worlds)
+                {
+                    if (w == robotWorld || w.Hidden || w.Covered) continue;
+                    float s = w.JobScore();
+                    if (s > bestScore) { bestScore = s; best = w; }
+                }
+                if (best != null) SendRobotTo(best, true, float.NaN, float.NaN);
+            }
+        }
+
+        void SendRobotTo(World tgt, bool auto, float lx, float ly)
+        {
+            var src = robotWorld;
+            robot.Target = tgt;
+            robot.PendingAuto = auto;
+            robot.PendingSend = !auto;
+            robot.PendingX = lx; robot.PendingY = ly;
+            int side = Math.Sign((tgt.B.X + tgt.B.Width / 2) - (src.B.X + src.B.Width / 2));
+            src.SendAway(side == 0 ? 1 : side);
         }
 
         // Im Hintergrund-Modus: komplett verdeckte Monitore nicht berechnen (spart CPU).
@@ -2080,6 +2881,16 @@ namespace Snowglobe
                 if (e.Kind == 1 && robotWorld != null) robotWorld.Poke();
                 else if (e.Kind == 2) { SendRobot(e.Pt); SetTool(0); }
                 else if (e.Kind == 3) SetTool(0);
+                else if (e.Kind == 4)
+                {
+                    prevCur = e.Pt;
+                    SetTool(1, true);
+                    if (!shovelTipShown)
+                    {
+                        shovelTipShown = true;
+                        tray.ShowBalloonTip(3000, "Schaufel in der Hand", "Ziehen schiebt Schnee, hochziehen und loslassen wirft ihn. Rechtsklick stellt die Schaufel zurück.", ToolTipIcon.None);
+                    }
+                }
             }
         }
 
@@ -2087,14 +2898,9 @@ namespace Snowglobe
         {
             var w = WorldAt(p.X, p.Y);
             if (w == null) return;
-            if (!robotShown) { robotShown = true; SaveSetting("Robot", 1); UpdateHook(); }
+            if (!robotShown) SetRobotShown(true);
             float lx = p.X - w.B.X, ly = p.Y - w.B.Y;
-            if (robotWorld != w)
-            {
-                if (robotWorld != null) robotWorld.Bot = null;
-                robotWorld = w;
-                w.RobotEnter(robot, lx, true, lx);
-            }
+            if (robotWorld != w) SendRobotTo(w, false, lx, ly);
             else w.SendTo(lx, ly);
         }
 
@@ -2106,7 +2912,7 @@ namespace Snowglobe
             bool valid = fg != IntPtr.Zero && !own.Contains(fg) && N.GetWindowRect(fg, out r) && !N.IsZoomed(fg);
             if (valid)
             {
-                string cls = N.ClassOf(fg);
+                string cls = CachedClass(fg);
                 if (cls == "Progman" || cls == "WorkerW" || cls == "Shell_TrayWnd") valid = false;
             }
             foreach (var w in worlds)
@@ -2121,7 +2927,7 @@ namespace Snowglobe
 
         // ---- Werkzeuge
 
-        void SetTool(int t)
+        void SetTool(int t, bool keepDown = false)
         {
             if (t == tool) return;
             if (tool == 1 && shovelLoad > 0)
@@ -2132,25 +2938,23 @@ namespace Snowglobe
             }
             tool = t;
             hook.Tool = t;
-            hook.LeftDown = false;
+            if (!keepDown) hook.LeftDown = false;
             prevDown = false;
             if (t != 0 && paused) TogglePause();
             UpdateHook();
             ApplyZOrder(true);
             UpdateCovered();
-            if (t == 1) tray.ShowBalloonTip(3000, "Schaufel aktiv", "Mit gedrückter linker Maustaste Schnee schieben, hochheben und werfen. Rechtsklick oder Strg+Alt+S beendet.", ToolTipIcon.None);
-            if (t == 2) tray.ShowBalloonTip(3000, "Schneeroboter", "Klick auf eine Stelle: Der Roboter räumt den Schnee dort zu einem Haufen. Rechtsklick bricht ab.", ToolTipIcon.None);
+            if (t == 2) tray.ShowBalloonTip(3000, "Schneeroboter", "Klick auf eine Stelle: Der Roboter fährt hin (auch auf andere Monitore) und schiebt den Schnee dort an den Rand. Rechtsklick bricht ab.", ToolTipIcon.None);
         }
 
         void OnHotkey(int id)
         {
-            if (id == 1) SetTool(tool == 1 ? 0 : 1);
             if (id == 2) SetTool(tool == 2 ? 0 : 2);
         }
 
         void UpdateHook()
         {
-            bool need = tool != 0 || robotShown;
+            bool need = tool != 0 || robotShown || shovelShown;
             if (need && !hook.Running) hook.Start();
             else if (!need && hook.Running) hook.Stop();
         }
@@ -2161,16 +2965,52 @@ namespace Snowglobe
             SaveSetting("Robot", on ? 1 : 0);
             if (on && robotWorld == null)
             {
-                var w = worlds.Find(delegate (World x) { return x.B.Contains(Screen.PrimaryScreen.Bounds.Location); }) ?? worlds[0];
+                var w = shovelWorld ?? worlds[0];
                 robotWorld = w;
-                w.RobotEnter(robot, w.B.Width * 0.18f, false, float.NaN);
+                w.RobotDrop(robot, w.B.Width * 0.18f);
             }
             else if (!on && robotWorld != null)
             {
                 robotWorld.Bot = null;
+                robotWorld.ClosePipe();
                 robotWorld = null;
             }
             UpdateHook();
+        }
+
+        void SetShovelShown(bool on)
+        {
+            shovelShown = on;
+            SaveSetting("Shovel", on ? 1 : 0);
+            if (!on && tool == 1) SetTool(0);
+            UpdateHook();
+            if (on) tray.ShowBalloonTip(3000, "Schaufel bereit", "Die Schaufel steht unten rechts am Hauptmonitor. Anklicken oder direkt ziehen – Rechtsklick stellt sie zurück.", ToolTipIcon.None);
+        }
+
+        // ---- Updates
+
+        void CheckForUpdate(bool manual)
+        {
+            if (updating) return;
+            updating = true;
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                string msg = null, path = null;
+                Version found;
+                try { path = Updater.Check(out msg, out found); }
+                catch (Exception ex) { msg = "Update fehlgeschlagen: " + ex.Message; }
+                ui.Post(delegate
+                {
+                    updating = false;
+                    if (path != null)
+                    {
+                        tray.ShowBalloonTip(3000, "Snowglobe-Update", msg, ToolTipIcon.None);
+                        if (Updater.Install(path)) Quit();
+                        else tray.ShowBalloonTip(4000, "Snowglobe-Update", "Konnte die Datei nicht ersetzen (Schreibrechte?).", ToolTipIcon.Warning);
+                    }
+                    else if (manual && msg != null) tray.ShowBalloonTip(3000, "Snowglobe-Update", msg, ToolTipIcon.None);
+                }, null);
+            });
         }
 
         // ---- Tray
@@ -2178,7 +3018,7 @@ namespace Snowglobe
         void BuildTray()
         {
             var menu = new ContextMenuStrip();
-            menu.Items.Add(new ToolStripMenuItem("Snowglobe ❄") { Enabled = false });
+            menu.Items.Add(new ToolStripMenuItem("Snowglobe " + Updater.Current + " ❄") { Enabled = false });
             menu.Items.Add(new ToolStripSeparator());
             densityItems = new ToolStripMenuItem[3];
             for (int i = 0; i < 3; i++)
@@ -2188,14 +3028,13 @@ namespace Snowglobe
                 menu.Items.Add(densityItems[i]);
             }
             menu.Items.Add(new ToolStripSeparator());
-            shovelItem = new ToolStripMenuItem("Schaufel", null, delegate { SetTool(tool == 1 ? 0 : 1); });
-            shovelItem.ShortcutKeyDisplayString = "Strg+Alt+S";
+            shovelItem = new ToolStripMenuItem("Schaufel bereitstellen", null, delegate { SetShovelShown(!shovelShown); });
             menu.Items.Add(shovelItem);
             var robotMenu = new ToolStripMenuItem("Schneeroboter");
             sendItem = new ToolStripMenuItem("Hinschicken …", null, delegate { SetTool(tool == 2 ? 0 : 2); });
             sendItem.ShortcutKeyDisplayString = "Strg+Alt+R";
             robotShowItem = new ToolStripMenuItem("Anzeigen", null, delegate { SetRobotShown(!robotShown); });
-            robotAutoItem = new ToolStripMenuItem("Automatik (räumt selbstständig)", null, delegate
+            robotAutoItem = new ToolStripMenuItem("Automatik (räumt alle Monitore)", null, delegate
             {
                 World.RobotAuto = !World.RobotAuto;
                 SaveSetting("RobotAuto", World.RobotAuto ? 1 : 0);
@@ -2218,6 +3057,11 @@ namespace Snowglobe
             menu.Items.Add(captureItem);
             autostartItem = new ToolStripMenuItem("Mit Windows starten", null, delegate { ToggleAutostart(); });
             menu.Items.Add(autostartItem);
+            var upd = new ToolStripMenuItem("Updates");
+            updateItem = new ToolStripMenuItem("Automatisch aktualisieren", null, delegate { autoUpdate = !autoUpdate; SaveSetting("AutoUpdate", autoUpdate ? 1 : 0); });
+            upd.DropDownItems.Add(updateItem);
+            upd.DropDownItems.Add(new ToolStripMenuItem("Jetzt nach Updates suchen", null, delegate { CheckForUpdate(true); }));
+            menu.Items.Add(upd);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Beenden", null, delegate { Quit(); }));
             menu.Opening += delegate { RefreshMenu(); };
@@ -2238,10 +3082,11 @@ namespace Snowglobe
             captureItem.Checked = excludeCapture;
             autostartItem.Checked = IsAutostart();
             backgroundItem.Checked = background;
-            shovelItem.Checked = tool == 1;
+            shovelItem.Checked = shovelShown;
             sendItem.Checked = tool == 2;
             robotShowItem.Checked = robotShown;
             robotAutoItem.Checked = World.RobotAuto;
+            updateItem.Checked = autoUpdate;
         }
 
         void SetDensity(int d)
@@ -2362,20 +3207,23 @@ namespace Snowglobe
 
     static class Program
     {
-        public static bool ForceAuto;
+        public static bool ForceAuto, Perf, NoGpu;
 
         [STAThread]
         static void Main(string[] args)
         {
             try { N.SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
 
-            bool capture = false, dump = false;
+            bool capture = false, dump = false, updated = false;
             foreach (var a in args)
             {
                 if (a == "--capture") capture = true;
                 if (a == "--dump") dump = true;
                 if (a == "--fast") World.DepositBoost = 8f;
                 if (a == "--auto") ForceAuto = true;
+                if (a == "--perf") Perf = true;
+                if (a == "--nogpu") NoGpu = true;
+                if (a == "--updated") updated = true;
                 if (a == "--selftest")
                 {
                     File.WriteAllText(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "selftest.txt"), World.SelfTest());
@@ -2388,10 +3236,16 @@ namespace Snowglobe
             bool created;
             using (var mutex = new Mutex(true, @"Local\Snowglobe.SingleInstance", out created))
             {
-                if (!created) return;
+                if (!created)
+                {
+                    // nach einem Update kurz warten, bis die alte Version beendet ist
+                    if (!updated) return;
+                    try { if (!mutex.WaitOne(15000)) return; }
+                    catch (AbandonedMutexException) { }
+                }
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                Application.Run(new App(capture));
+                Application.Run(new App(capture, updated));
             }
         }
 

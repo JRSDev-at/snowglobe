@@ -1,0 +1,66 @@
+# Baut bei jedem Push auf main eine neue Snowglobe.exe und veröffentlicht sie als Release,
+# sobald die AssemblyVersion in src/Snowglobe.cs erhöht wurde. Installierte Snowglobes
+# finden das Release über die GitHub-API und aktualisieren sich selbst.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: ['src/**', 'build.cmd']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version lesen
+        id: ver
+        shell: pwsh
+        run: |
+          $m = Select-String -Path src/Snowglobe.cs -Pattern 'AssemblyVersion\("(\d+)\.(\d+)\.(\d+)' | Select-Object -First 1
+          $v = "{0}.{1}.{2}" -f $m.Matches[0].Groups[1].Value, $m.Matches[0].Groups[2].Value, $m.Matches[0].Groups[3].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Gibt es das Release schon?
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "v${{ steps.ver.outputs.version }}" --repo "${{ github.repository }}" *> $null
+          if ($LASTEXITCODE -eq 0) { "exists=true" >> $env:GITHUB_OUTPUT } else { "exists=false" >> $env:GITHUB_OUTPUT }
+          exit 0
+
+      - name: Bauen
+        if: steps.check.outputs.exists == 'false'
+        shell: cmd
+        run: build.cmd
+
+      - name: Selbsttest
+        if: steps.check.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          Start-Process bin/Snowglobe.exe -ArgumentList "--selftest","--nogpu" -Wait
+          Get-Content bin/selftest.txt
+          if (Select-String -Path bin/selftest.txt -Pattern 'FEHLER' -Quiet) { exit 1 }
+
+      - name: Prüfsumme
+        if: steps.check.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash bin/Snowglobe.exe -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("bin/Snowglobe.exe.sha256", "$h  Snowglobe.exe")
+
+      - name: Release veröffentlichen
+        if: steps.check.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ steps.ver.outputs.version }}" bin/Snowglobe.exe bin/Snowglobe.exe.sha256 `
+            --repo "${{ github.repository }}" --title "Snowglobe ${{ steps.ver.outputs.version }}" --generate-notes

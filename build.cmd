@@ -7,7 +7,7 @@ cd /d "%~dp0"
 if not exist bin mkdir bin
 "%CSC%" /nologo /target:winexe /unsafe /optimize+ /platform:anycpu ^
   /win32manifest:src\app.manifest ^
-  /r:System.Windows.Forms.dll /r:System.Drawing.dll ^
+  /r:System.Windows.Forms.dll /r:System.Drawing.dll /r:System.Web.Extensions.dll ^
   /out:bin\Snowglobe.exe src\Snowglobe.cs
 if errorlevel 1 exit /b 1
 echo Fertig: bin\Snowglobe.exe
