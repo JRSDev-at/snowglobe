@@ -6,7 +6,8 @@ name: Release
 on:
   push:
     branches: [main]
-    paths: ['src/**', 'build.cmd']
+    # Auch Änderungen am Workflow selbst lösen ihn aus; ohne neue Version passiert nichts.
+    paths: ['src/**', 'build.cmd', '.github/workflows/release.yml']
   workflow_dispatch:
 
 permissions:
