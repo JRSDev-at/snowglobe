@@ -12,14 +12,14 @@ Leichter Schneefall direkt auf dem Windows-Desktop, mit Schaufel, Schneeroboter 
 
 ## Schaufel
 Tray-Menü → **Schaufel bereitstellen**: Unten rechts am Hauptmonitor steckt eine Schaufel im Schnee.
-- **Linksklick** (großzügige Klickfläche) nimmt sie in die Hand, mit etwas Schneegestöber. Direkt ziehen geht auch.
-- **Ziehen** mit gedrückter Taste schiebt Schnee wie ein Schneepflug. **Hochziehen** nimmt eine Ladung aufs Blatt, **Loslassen** wirft sie in Bewegungsrichtung ab, auch auf andere Fenster.
+- **Linksklick** (großzügige Klickfläche) nimmt sie in die Hand, mit etwas Schneegestöber.
+- In der Hand ist sie **sofort aktiv, ohne Taste**: Fährst du mit der Maus durch den Schnee, schiebt sie ihn wie ein Schneepflug. **Hochziehen** nimmt eine Ladung aufs Blatt, eine **schwungvolle Bewegung** wirft sie in diese Richtung ab, auch auf andere Fenster. (Mit gedrückter Taste ziehen und loslassen wirft ebenfalls.)
 - Die Schaufel bewegt sich mit: Sie schabt beim Schieben über den Boden, kippt beim Hochziehen nach hinten, schwingt beim Tragen nach und schnellt beim Wurf hoch.
 - **Kurzer Linksklick** (ohne Ziehen) sticht die Schaufel an dieser Stelle in den Schnee, auch auf ein Fenster. Verschwindet das Fenster, fällt sie auf die nächste Fläche darunter.
 - **Rechtsklick** bringt sie zurück an ihren Platz unten rechts. Solange du sie hältst, gehen Linksklicks nicht an andere Programme.
 
 ## Schneeroboter
-Ein kleiner Räumroboter. Seine Aufgabe: liegenden Schnee **an den Bildschirmrand zu großen Haufen schieben**. Am Boden schiebt er die linke Hälfte nach links und die rechte nach rechts, von Fenstern schiebt er den Schnee über die Kanten.
+Ein kleiner Räumroboter. Seine Aufgabe: liegenden Schnee **an den Bildschirmrand schieben**. Am Boden schiebt er die linke Hälfte nach links und die rechte nach rechts. Am Rand bleibt nur ein **kleiner Hügel** (höchstens 28 px), alles darüber schiebt er **aus dem Bild hinaus**, damit nichts verdeckt wird. Auch alte, zu große Randhaufen stutzt er so zurecht. Von Fenstern schiebt er den Schnee über die Kanten.
 - **Anklicken:** Er räumt sofort die Fläche, auf der er steht.
 - **Hinschicken (Strg+Alt+R)**, dann auf eine Stelle klicken: Er fährt hin und räumt dort, auch auf anderen Monitoren.
 - **Automatik:** Er räumt selbstständig die Fläche mit dem meisten Schnee, **auf allen Monitoren**.

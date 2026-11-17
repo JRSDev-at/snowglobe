@@ -1044,7 +1044,7 @@ namespace Snowglobe
 
         readonly Art[] robotArt, shovelArt, pipeArt;
         readonly Art markerArt, lampRed, lampAmber, shovelStand;
-        readonly float RF, RB, EdgeHeap;
+        readonly float RF, RB, EdgeHeap, HeapMax;
 
         public World(Rectangle bounds, Rectangle work, float scale, int seed)
         {
@@ -1063,6 +1063,7 @@ namespace Snowglobe
             lampRed = Art.Lamp(S, Color.FromArgb(255, 255, 60, 50));
             lampAmber = Art.Lamp(S, Color.FromArgb(255, 255, 180, 30));
             EdgeHeap = 26f * S;
+            HeapMax = 28f * S;     // Randhügel des Roboters: höchstens so hoch, der Rest fliegt aus dem Bild
         }
 
         float Rnd() { return (float)rnd.NextDouble(); }
@@ -1196,7 +1197,7 @@ namespace Snowglobe
 
         // Schnee oberhalb der Höhe h0 im Spaltenbereich [wx0, wx1) aufnehmen; was über
         // "keep" hinausgeht, wird vor dem Schild in Richtung dir abgelegt (Schneepflug).
-        void Plow(Surface s, float wx0, float wx1, float h0, int dir, ref float load, float keep, bool spillOver)
+        void Plow(Surface s, float wx0, float wx1, float h0, int dir, ref float load, float keep, bool spillOver, float limit = float.MaxValue)
         {
             int c0 = Math.Max(0, (int)wx0 - s.X0), c1 = Math.Min(s.N, (int)wx1 - s.X0);
             for (int j = c0; j < c1; j++)
@@ -1214,7 +1215,7 @@ namespace Snowglobe
                 int j = f + k * dir;
                 float part = amt * (w - k) / sum;
                 if (j < 0 || j >= s.N) { if (spillOver) spill += part; else left += part; continue; }
-                float room = Math.Max(0f, s.Cap2[j] - s.H[j]);
+                float room = Math.Max(0f, Math.Min(limit, s.Cap2[j]) - s.H[j]);
                 float add = Math.Min(room, part);
                 s.H[j] += add;
                 if (s.H[j] > s.Peak) s.Peak = s.H[j];
@@ -1229,7 +1230,7 @@ namespace Snowglobe
         }
 
         // Restladung von innen nach außen um eine Spalte herum aufschütten (bis Cap2).
-        void Fill(Surface s, float wx, ref float load)
+        void Fill(Surface s, float wx, ref float load, float limit = float.MaxValue)
         {
             int c = Math.Max(0, Math.Min(s.N - 1, (int)wx - s.X0));
             for (int r = 0; r < s.N && load > 0.01f; r++)
@@ -1239,11 +1240,21 @@ namespace Snowglobe
                     if (r == 0 && side > 0) continue;
                     int j = c + side * r;
                     if (j < 0 || j >= s.N) continue;
-                    float add = Math.Min(load, Math.Max(0f, s.Cap2[j] - s.H[j]) * 0.5f);
+                    float add = Math.Min(load, Math.Max(0f, Math.Min(limit, s.Cap2[j]) - s.H[j]) * 0.5f);
                     s.H[j] += add; load -= add;
                     if (s.H[j] > s.Peak) s.Peak = s.H[j];
                 }
             }
+        }
+
+        // Überschüssigen Schnee über den Bildschirmrand hinausschieben (verschwindet aus dem Bild).
+        void PushOut(int dir, float y, float amount)
+        {
+            float edge = dir > 0 ? W : 0;
+            int n = Math.Min(400, (int)(amount / (8f * S * S)) + 1);
+            for (int i = 0; i < n; i++)
+                AddDebris(edge - dir * Rnd() * 10f * S, y - Rnd() * 8f * S,
+                          dir * (90f + Rnd() * 120f) * S, -(20f + Rnd() * 60f) * S, Rnd() * 0.5f, Rnd() < 0.4f);
         }
 
         // Schnee als herabfallende Brocken freisetzen.
@@ -1260,10 +1271,19 @@ namespace Snowglobe
         public void ShovelStep(float x, float y, float px, float py, bool down, ref float load)
         {
             ShovelOn = true; shX = x; shY = y;
-            shVx = x - px; shVy = y - py; shDown = down;
+            shVx = x - px; shVy = y - py; shDown = false;
             if (x - px > 0.5f) shDir = 1; else if (x - px < -0.5f) shDir = -1;
             if (down)
             {
+                // Berührt das Blatt gerade Schnee bzw. eine Fläche? (für die Animation)
+                for (int k = 0; k < surfs.Count && !shDown; k++)
+                {
+                    var s = surfs[k];
+                    int col = (int)x - s.X0;
+                    if (col < 0 || col >= s.N || !s.Vis[col]) continue;
+                    float bse = s.Base(col);
+                    if (y >= bse - s.H[col] - 1f && y <= bse + 8f * S) shDown = true;
+                }
                 float dist = Math.Max(Math.Abs(x - px), Math.Abs(y - py));
                 int steps = Math.Max(1, (int)(dist / 3f));
                 int sdx = x > px + 0.3f ? 1 : (x < px - 0.3f ? -1 : 0);
@@ -1608,7 +1628,7 @@ namespace Snowglobe
                     bool reached = b.Dir > 0 ? b.X >= b.Cur.End : b.X <= b.Cur.End;
                     if (reached) b.X = b.Cur.End;
                     float front = b.X + b.Dir * RF, back = b.X - b.Dir * RB;
-                    Plow(s, Math.Min(front, back), Math.Max(front, back), 0f, b.Dir, ref b.Load, 0f, b.Spill);
+                    Plow(s, Math.Min(front, back), Math.Max(front, back), 0f, b.Dir, ref b.Load, 0f, b.Spill, b.Spill ? float.MaxValue : HeapMax);
                     b.Yb += (s.Base(Math.Max(0, Math.Min(s.N - 1, (int)b.X - s.X0))) - b.Yb) * follow;
                     if (reached)
                     {
@@ -1621,7 +1641,16 @@ namespace Snowglobe
                             Spill(b.Dir > 0 ? s.X1 : s.X0 - 1, s.Y - 3 * S, amt, b.Dir * 50f * S, -15f * S);
                             b.Load = 0;
                         }
-                        else if (b.Load > 0.01f) Fill(s, front + b.Dir * 4f * S, ref b.Load);
+                        else
+                        {
+                            // Am Bildschirmrand nur ein kleiner Hügel, der Rest wird hinausgeschoben
+                            float amt = b.Load;
+                            int c0 = b.Dir > 0 ? (int)front - s.X0 : 0, c1 = b.Dir > 0 ? s.N : (int)front - s.X0 + 1;
+                            for (int j = Math.Max(0, c0); j < Math.Min(s.N, c1); j++)
+                                if (s.H[j] > HeapMax) { amt += s.H[j] - HeapMax; s.H[j] = HeapMax; }
+                            b.Load = 0;
+                            if (amt > 0.5f) PushOut(b.Dir, s.Y - HeapMax, amt);
+                        }
                         NextRun();
                     }
                     break;
@@ -2268,7 +2297,8 @@ namespace Snowglobe
             Array.Clear(g.H, 0, g.N); w.ndb = 0;
             var rnd = new Random(3);
             for (int j = 0; j < g.N; j++) g.H[j] = 3f + (float)rnd.NextDouble() * 2f;
-            g.Peak = 5f;
+            for (int j = g.N - 40; j < g.N; j++) g.H[j] = 90f;   // alter, zu großer Randhaufen
+            g.Peak = 90f;
             var r = new Robot();
             w.RobotPlace(r);
             r.X = 700;
@@ -2277,9 +2307,12 @@ namespace Snowglobe
             int steps = 0;
             for (; steps < 30 * 180; steps++) { w.Step(1f / 30f, steps / 30f); if (steps > 30 && r.State == Robot.Idle) break; }
             float leftHeap = g.Sum(0, 300), rightHeap = g.Sum(g.N - 300, g.N), all = g.Sum(0, g.N);
-            sb.AppendLine(string.Format("Roboter: fertig nach {0:F1} s, links {1:P0} / rechts {2:P0} des Schnees am Rand, Haufenhöhe {3:F0} px -> {4}",
-                steps / 30f, leftHeap / all, rightHeap / all, g.Peak, Ok((leftHeap + rightHeap) / all > 0.9f && leftHeap > 0.3f * all && rightHeap > 0.3f * all)));
-            sb.AppendLine(string.Format("  Schnee vorher {0:F0} px², nachher {1:F0} px²", total, all));
+            { var dbg = new StringBuilder("  Verteilung:"); for (int q = 0; q < g.N; q += 120) dbg.Append(" " + g.Sum(q, q + 120).ToString("F0")); sb.AppendLine(dbg.ToString()); }
+            float maxH = 0;
+            for (int j = 0; j < g.N; j++) maxH = Math.Max(maxH, g.H[j]);
+            sb.AppendLine(string.Format("Roboter: fertig nach {0:F1} s, links {1:P0} / rechts {2:P0} des Schnees am Rand, Hügelhöhe max. {3:F0} px -> {4}",
+                steps / 30f, leftHeap / all, rightHeap / all, maxH, Ok((leftHeap + rightHeap) / all > 0.9f && leftHeap > 0.3f * all && rightHeap > 0.3f * all && maxH <= w.HeapMax + 1f)));
+            sb.AppendLine(string.Format("  Schnee vorher {0:F0} px², nachher {1:F0} px² (Rest aus dem Bild geschoben) -> {2}", total, all, Ok(all < total * 0.85f)));
 
             // 4) Roboter auf einem Fenster schiebt den Schnee über beide Kanten
             var win = new WinInfo(); win.H = new IntPtr(777); win.Surface = true;
@@ -2645,7 +2678,7 @@ namespace Snowglobe
         int frame, density, tool;
         bool paused, locked, excludeCapture, background, robotShown, shovelShown, autoUpdate, updating, needSurfaceUpdate = true, shovelTipShown;
         IntPtr deskHost;
-        float shovelLoad;
+        float shovelLoad, shVelX, shVelY;
         POINT prevCur;
         bool prevDown;
         World robotWorld, shovelWorld;
@@ -3021,13 +3054,23 @@ namespace Snowglobe
             {
                 bool down = hook.LeftDown;
                 float lx = cp.X - wc.B.X, ly = cp.Y - wc.B.Y;
+                float vx = (cp.X - prevCur.X) / Math.Max(dt, 0.01f), vy = (cp.Y - prevCur.Y) / Math.Max(dt, 0.01f);
+                shVelX = shVelX * 0.55f + vx * 0.45f; shVelY = shVelY * 0.55f + vy * 0.45f;
+                float speed = (float)Math.Sqrt(shVelX * shVelX + shVelY * shVelY) / wc.S;
                 if (prevDown && !down)
                 {
-                    float vx = (cp.X - prevCur.X) / Math.Max(dt, 0.01f), vy = (cp.Y - prevCur.Y) / Math.Max(dt, 0.01f);
+                    // Taste losgelassen nach Ziehen: Ladung abwerfen
                     wc.DropLoad(lx, ly, ref shovelLoad, vx * 0.6f, vy * 0.6f);
-                    wc.ShovelStep(lx, ly, lx, ly, false, ref shovelLoad);
+                    wc.ShovelStep(lx, ly, lx, ly, true, ref shovelLoad);
                 }
-                else wc.ShovelStep(lx, ly, prevCur.X - wc.B.X, prevCur.Y - wc.B.Y, down, ref shovelLoad);
+                else if (!down && shovelLoad > 40f * wc.S * wc.S && speed > 1500f)
+                {
+                    // Schwungvolle Bewegung mit voller Schaufel: Schnee fliegt in Bewegungsrichtung
+                    wc.DropLoad(lx, ly, ref shovelLoad, shVelX * 0.55f, shVelY * 0.55f);
+                    wc.ShovelStep(lx, ly, lx, ly, true, ref shovelLoad);
+                }
+                // In der Hand ist die Schaufel immer aktiv, keine Taste nötig
+                else wc.ShovelStep(lx, ly, prevCur.X - wc.B.X, prevCur.Y - wc.B.Y, true, ref shovelLoad);
                 wc.ShovelAnimate(dt);
                 prevDown = down;
             }
@@ -3054,12 +3097,13 @@ namespace Snowglobe
                 else if (e.Kind == 4)
                 {
                     prevCur = e.Pt;
+                    shVelX = shVelY = 0;
                     if (shovelWorld != null) shovelWorld.ShovelPickedUp();
                     SetTool(1, true);
                     if (!shovelTipShown)
                     {
                         shovelTipShown = true;
-                        tray.ShowBalloonTip(3000, "Schaufel in der Hand", "Ziehen schiebt Schnee, hochziehen und loslassen wirft ihn. Linksklick stellt die Schaufel dort ab, Rechtsklick bringt sie zurück an ihren Platz.", ToolTipIcon.None);
+                        tray.ShowBalloonTip(3000, "Schaufel in der Hand", "Einfach durch den Schnee fahren, keine Taste nötig. Mit Schwung wirft sie die Ladung. Linksklick stellt die Schaufel ab, Rechtsklick bringt sie zurück an ihren Platz.", ToolTipIcon.None);
                     }
                 }
                 else if (e.Kind == 5 && tool == 1)
