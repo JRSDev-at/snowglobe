@@ -1,4 +1,4 @@
-// Snowglobe – leichter Schneefall für den Windows-Desktop.
+﻿// Snowglobe – leichter Schneefall für den Windows-Desktop.
 // Ein transparentes, durchklickbares Overlay pro Monitor. Schnee bleibt auf
 // Fensteroberkanten, Desktop-Icons und am Bildschirmboden liegen. Dazu eine
 // Schaufel, ein Schneeroboter und automatische Updates über GitHub-Releases.
@@ -24,7 +24,7 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("Snowglobe")]
 [assembly: AssemblyProduct("Snowglobe")]
-[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.3.0.0")]
 
 namespace Snowglobe
 {
@@ -699,17 +699,27 @@ namespace Snowglobe
             return res;
         }
 
-        // Schaufel: [0] schiebt nach rechts, [1] nach links. Anker = Mitte der Schaufelkante.
+        // Schaufel in ShovelAngles Neigungen (ShovelStep0 + k * ShovelStepDeg Grad):
+        // [k] schiebt nach rechts, [ShovelAngles + k] nach links. Anker = Mitte der Schaufelkante,
+        // um ihn wird gedreht (negativ = Blatt vorne hoch).
+        public const int ShovelAngles = 17;
+        public const float ShovelStep0 = -40f, ShovelStepDeg = 5f;
+
         public static Art[] Shovel(float u)
         {
-            int w = (int)Math.Ceiling(46 * u), h = (int)Math.Ceiling(46 * u);
-            int ax = (int)(22 * u);
-            var res = new Art[2];
+            int w = (int)Math.Ceiling(74 * u), h = (int)Math.Ceiling(66 * u);
+            int ax = (int)(48 * u), ay = (int)(53 * u);
+            var res = new Art[2 * ShovelAngles];
             for (int dir = 0; dir < 2; dir++)
+            for (int k = 0; k < ShovelAngles; k++)
             {
-                float hb = h - 0.5f;
-                res[dir] = Build(w, h, ax, h, dir == 1, delegate (Graphics g)
+                float hb = 46 * u - 0.5f;
+                float ang = ShovelStep0 + k * ShovelStepDeg;
+                res[dir * ShovelAngles + k] = Build(w, h, ax, ay, dir == 1, delegate (Graphics g)
                 {
+                    g.TranslateTransform(ax, ay);
+                    g.RotateTransform(ang);
+                    g.TranslateTransform(-22 * u, -46 * u);
                     using (var pen = new Pen(Color.FromArgb(255, 150, 98, 52), 2.8f * u))
                     {
                         pen.StartCap = pen.EndCap = LineCap.Round;
@@ -1007,7 +1017,12 @@ namespace Snowglobe
         public bool ShovelOn, MarkerOn, ShovelParked;
         public bool RobotGone;
         float shX, shY, shLoad, mkX, mkY;
+        float shVx, shVy, shAng = 10f, shAngV, shBob;   // Animation der gehaltenen Schaufel
+        bool shDown;
         int shDir = 1;
+        // Abgestellte Schaufel: steckt bei parkX im Schnee, fällt bei Bedarf auf die nächste Fläche darunter.
+        bool parkHome = true, parkInit;
+        float parkX, parkY, parkVy, parkHint;
 
         readonly int W, Hh;
         Flake[] fl = new Flake[0];
@@ -1122,6 +1137,7 @@ namespace Snowglobe
             StepDebris(dt);
             if (Bot != null) StepRobot(dt);
             StepPipe(dt);
+            if (ShovelParked) StepPark(dt);
 
             flip = !flip;
             float melt = 0.006f * S;
@@ -1244,6 +1260,7 @@ namespace Snowglobe
         public void ShovelStep(float x, float y, float px, float py, bool down, ref float load)
         {
             ShovelOn = true; shX = x; shY = y;
+            shVx = x - px; shVy = y - py; shDown = down;
             if (x - px > 0.5f) shDir = 1; else if (x - px < -0.5f) shDir = -1;
             if (down)
             {
@@ -1272,20 +1289,130 @@ namespace Snowglobe
 
         public void DropLoad(float x, float y, ref float load, float vx, float vy)
         {
-            if (load > 0.5f) Spill(x, y - 3f * S, load, vx, vy);
+            if (load > 0.5f)
+            {
+                Spill(x, y - 3f * S, load, vx, vy);
+                shAngV -= 520f;   // Wurf: Blatt schnellt nach oben
+            }
             load = 0; shLoad = 0;
+        }
+
+        // Neigung der gehaltenen Schaufel: gedämpfte Feder auf einen Zielwinkel je nach Tätigkeit.
+        public void ShovelAnimate(float dt)
+        {
+            if (dt <= 0f) return;
+            float inv = 1f / Math.Max(dt, 0.005f);
+            float vx = shVx * inv / S, vy = shVy * inv / S;   // Pixel pro Sekunde (DPI-bereinigt)
+            float target;
+            if (shDown)
+            {
+                if (vy < -160f) target = -24f;                // hochziehen: Blatt kippt nach hinten, Ladung bleibt drauf
+                else target = 2f + Math.Min(4f, Math.Abs(vx) * 0.004f);   // flach am Boden schieben
+                shBob += Math.Abs(shVx) * 0.45f / S;
+            }
+            else
+            {
+                target = shLoad > 1f ? -16f : 12f;            // mit Ladung waagrecht halten, leer locker hängen lassen
+                target -= Math.Max(-16f, Math.Min(16f, vx * shDir * 0.012f));   // hinterherschwingen
+                target += Math.Max(-12f, Math.Min(12f, vy * 0.01f));
+                shBob *= 0.9f;
+            }
+            float acc = (target - shAng) * 210f - shAngV * 15f;
+            shAngV += acc * dt;
+            shAng += shAngV * dt;
+            float lo = Art.ShovelStep0, hi = Art.ShovelStep0 + (Art.ShovelAngles - 1) * Art.ShovelStepDeg;
+            if (shAng < lo) { shAng = lo; shAngV = 0; } else if (shAng > hi) { shAng = hi; shAngV = 0; }
         }
 
         public void SetMarker(float x, float y) { MarkerOn = true; mkX = x; mkY = y; }
 
-        float ParkX { get { return W - 120f * S; } }
+        float ParkX { get { if (parkHome) parkX = W - 120f * S; return parkX; } }
 
+        // Oberste Schneeoberfläche bei x, die nicht über y liegt.
+        float TopBelow(float x, float y)
+        {
+            float best = ground.Top(x);
+            for (int k = 0; k < surfs.Count; k++)
+            {
+                var s = surfs[k];
+                if (s == ground) continue;
+                int col = (int)x - s.X0;
+                if (col < 0 || col >= s.N || !s.Vis[col]) continue;
+                float t = s.Base(col) - s.H[col];
+                if (t >= y && t < best) best = t;
+            }
+            return best;
+        }
+
+        float ParkTarget()
+        {
+            float x = ParkX;
+            return (parkHome ? ground.Top(x) : TopBelow(x, parkHint)) + 4f * S;
+        }
+
+        void StepPark(float dt)
+        {
+            float tgt = ParkTarget();
+            if (!parkInit) { parkInit = true; parkY = tgt; parkVy = 0; }
+            if (parkY < tgt - 0.5f)
+            {
+                // fällt (oder sticht beim Abstellen ein)
+                parkVy += 2600f * S * dt;
+                parkY += parkVy * dt;
+                if (parkY >= tgt)
+                {
+                    parkY = tgt;
+                    if (parkVy > 250f * S) Puff(ParkX, tgt - 4f * S, Math.Min(18, (int)(parkVy / (40f * S))));
+                    parkVy = 0;
+                }
+            }
+            else { parkY = tgt; parkVy = 0; }
+            if (!parkHome) parkHint = parkY - 6f * S;
+        }
+
+        // Kleine Schneewolke beim Einstechen und Herausziehen.
+        void Puff(float x, float y, int n)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                float side = Rnd() < 0.5f ? -1f : 1f;
+                AddDebris(x + side * (3f + Rnd() * 6f) * S, y - Rnd() * 3f * S,
+                          side * (30f + Rnd() * 70f) * S, -(60f + Rnd() * 110f) * S, Rnd() * 0.05f, Rnd() < 0.25f);
+            }
+        }
+
+        // Schaufel an der Mausposition in den Schnee stecken.
+        public void PlantShovel(float x, float y)
+        {
+            parkHome = false;
+            parkX = Math.Max(10f * S, Math.Min(W - 10f * S, x));
+            parkHint = y - 2f * S;
+            float tgt = TopBelow(parkX, parkHint) + 4f * S;
+            parkY = Math.Min(tgt, y + 30f * S) - 16f * S;   // aus der Hand heraus einstechen
+            parkVy = 380f * S;
+            parkInit = true;
+        }
+
+        public void ShovelHome()
+        {
+            parkHome = true;
+            parkInit = false;
+        }
+
+        public void ShovelPickedUp()
+        {
+            Puff(ParkX, parkY - 4f * S, 10);
+            shAng = -30f; shAngV = 0;   // wird mit Schwung aus dem Schnee gezogen
+        }
+
+        // Großzügige Klickfläche um die abgestellte Schaufel.
         public Rectangle ShovelParkRect()
         {
             var a = shovelStand;
-            float y = ground.Top(ParkX) + 4f * S;
-            int m = (int)(5 * S);
-            return new Rectangle(B.X + (int)ParkX - a.AX - m, B.Y + (int)y - a.H - m, a.W + 2 * m, a.H + 2 * m);
+            float y = parkInit ? parkY : ParkTarget();
+            int bw = (int)Math.Max(a.W + 24 * S, 46 * S);
+            int top = (int)(y - a.H - 10 * S), bottom = (int)(y + 8 * S);
+            return new Rectangle(B.X + (int)ParkX - bw / 2, B.Y + top, bw, bottom - top);
         }
 
         // ---- Roboter
@@ -1880,7 +2007,7 @@ namespace Snowglobe
             for (int k = 0; k < surfs.Count; k++) DrawPile(bits, surfs[k]);
             for (int i = 0; i < ndb; i++) Blit(bits, db[i].X, db[i].Y, db[i].Cls, db[i].Alpha);
             for (int i = 0; i < nfl; i++) Blit(bits, fl[i].X, fl[i].Y, fl[i].Cls, fl[i].Alpha);
-            if (ShovelParked) DrawArt(bits, shovelStand, (int)ParkX, (int)(ground.Top(ParkX) + 4f * S), int.MaxValue);
+            if (ShovelParked) DrawArt(bits, shovelStand, (int)ParkX, (int)(parkInit ? parkY : ParkTarget()), int.MaxValue);
             if (Bot != null && RobotVisible()) DrawRobot(bits);
             if (pipeState != 0) DrawPipe(bits);
             if (ShovelOn) DrawShovel(bits);
@@ -1910,8 +2037,11 @@ namespace Snowglobe
 
         void DrawShovel(uint* bits)
         {
-            var a = shovelArt[shDir > 0 ? 0 : 1];
-            int x = (int)Math.Round(shX), y = (int)Math.Round(shY);
+            int k = (int)Math.Round((shAng - Art.ShovelStep0) / Art.ShovelStepDeg);
+            k = Math.Max(0, Math.Min(Art.ShovelAngles - 1, k));
+            var a = shovelArt[(shDir > 0 ? 0 : Art.ShovelAngles) + k];
+            int x = (int)Math.Round(shX);
+            int y = (int)Math.Round(shY - (shDown ? Math.Abs(Math.Sin(shBob)) * 1.4f * S : 0f));   // Schaben über den Boden
             DrawArt(bits, a, x, y, int.MaxValue);
             if (shLoad > 1f)
             {
@@ -1919,14 +2049,16 @@ namespace Snowglobe
                 float mh = Math.Min(11f * S, (float)Math.Sqrt(shLoad) * 0.7f);
                 float hw = 9f * S;
                 int cx = x + (int)(shDir * 0.5f * S), by = y - (int)(2.4f * S);
+                float tilt = (float)Math.Sin((Art.ShovelStep0 + k * Art.ShovelStepDeg) * Math.PI / 180.0) * shDir;
                 int x0 = (int)(cx - hw), x1 = (int)(cx + hw);
                 for (int px = x0; px <= x1; px++)
                 {
                     if (px < 0 || px >= W) continue;
                     float t = (px - cx) / hw;
                     float h = mh * (float)Math.Sqrt(Math.Max(0f, 1f - t * t));
-                    float top = by - h;
-                    for (int py = (int)Math.Floor(top); py < by; py++)
+                    float byc = by + (px - cx) * tilt;   // Blatt ist geneigt
+                    float top = byc - h;
+                    for (int py = (int)Math.Floor(top); py < byc; py++)
                     {
                         if (py < 0 || py >= Hh) continue;
                         float cov = Math.Min(1f, py + 1 - top);
@@ -1936,7 +2068,8 @@ namespace Snowglobe
                         bits[(long)py * W + px] = ((uint)al << 24) | ((uint)(c * al / 255) << 16) | ((uint)((c + 3) * al / 255) << 8) | (uint)(255 * al / 255);
                     }
                 }
-                dirty.Add(new Rectangle(x0, (int)(by - mh) - 2, x1 - x0 + 1, (int)mh + 3));
+                int ty = (int)(hw * Math.Abs(tilt)) + 1;
+                dirty.Add(new Rectangle(x0, (int)(by - mh) - 2 - ty, x1 - x0 + 1, (int)mh + 3 + 2 * ty));
             }
         }
 
@@ -2110,6 +2243,27 @@ namespace Snowglobe
             w.DropLoad(720, 900, ref load, 200, -100);
             sb.AppendLine(string.Format("  hochgehoben {0:F0} px², geworfen als {1} Brocken -> {2}", carried, w.ndb, Ok(carried > 50 && w.ndb > 10)));
 
+            // 2b) Schaufel auf einem Fenster abstellen; Fenster weg -> sie fällt auf den Boden
+            {
+                w.ndb = 0;
+                var pw = new WinInfo(); pw.H = new IntPtr(5151); pw.Surface = true;
+                pw.R.Left = 400; pw.R.Top = 500; pw.R.Right = 900; pw.R.Bottom = 800;
+                w.UpdateSurfaces(new List<WinInfo> { pw }, fresh, icons, 0, 48);
+                w.ShovelParked = true;
+                w.PlantShovel(600, 480);
+                w.StepN(15);
+                float onWin = w.parkY;
+                Rectangle hit = w.ShovelParkRect();
+                w.UpdateSurfaces(none, fresh, icons, 0, 48);
+                w.StepN(30);
+                float fell = w.parkY;
+                sb.AppendLine(string.Format("Schaufel abgestellt: auf Fenster y={0:F0}, nach Schließen y={1:F0} (Boden {2}), Klickfläche {3}×{4} -> {5}",
+                    onWin, fell, g.Y, hit.Width, hit.Height,
+                    Ok(Math.Abs(onWin - 504) < 3 && Math.Abs(fell - (g.Top(600) + 4)) < 3 && hit.Width >= 44 && hit.Height >= 60 && hit.Contains(600, 470))));
+                w.ShovelParked = false;
+                w.ShovelHome();
+            }
+
             // 3) Roboter räumt den Boden zu Haufen an beiden Rändern
             Array.Clear(g.H, 0, g.N); w.ndb = 0;
             var rnd = new Random(3);
@@ -2228,7 +2382,9 @@ namespace Snowglobe
         public readonly ConcurrentQueue<HookEvt> Events = new ConcurrentQueue<HookEvt>();
         readonly object lk = new object();
         Rectangle robotRect, shovelRect;
-        bool robotActive, shovelActive, swallowLUp, swallowRUp;
+        bool robotActive, shovelActive, swallowLUp, swallowRUp, pickPress;
+        POINT downPt;
+        uint downTime;
         Thread th;
         uint tid;
         N.LLProc proc;
@@ -2283,13 +2439,21 @@ namespace Snowglobe
                     switch (msg)
                     {
                         case 0x0201: // LBUTTONDOWN
-                            if (tool == 1) { LeftDown = true; return new IntPtr(1); }
+                            if (tool == 1) { LeftDown = true; pickPress = false; downPt = info.pt; downTime = info.time; return new IntPtr(1); }
                             if (tool == 2) { Enqueue(2, info.pt); swallowLUp = true; return new IntPtr(1); }
-                            if (Hit(info.pt, true)) { Tool = 1; LeftDown = true; Enqueue(4, info.pt); return new IntPtr(1); }
+                            if (Hit(info.pt, true)) { Tool = 1; LeftDown = true; pickPress = true; Enqueue(4, info.pt); return new IntPtr(1); }
                             if (Hit(info.pt, false)) { Enqueue(1, info.pt); swallowLUp = true; return new IntPtr(1); }
                             break;
                         case 0x0202: // LBUTTONUP
-                            if (tool == 1) { LeftDown = false; return new IntPtr(1); }
+                            if (tool == 1)
+                            {
+                                LeftDown = false;
+                                // kurzer Klick ohne Ziehen = Schaufel hier abstellen (nicht beim Aufnehmen-Klick selbst)
+                                if (pickPress) pickPress = false;
+                                else if (Math.Abs(info.pt.X - downPt.X) <= 6 && Math.Abs(info.pt.Y - downPt.Y) <= 6 && info.time - downTime < 450)
+                                    Enqueue(5, info.pt);
+                                return new IntPtr(1);
+                            }
                             if (swallowLUp) { swallowLUp = false; return new IntPtr(1); }
                             break;
                         case 0x0204: // RBUTTONDOWN
@@ -2864,6 +3028,7 @@ namespace Snowglobe
                     wc.ShovelStep(lx, ly, lx, ly, false, ref shovelLoad);
                 }
                 else wc.ShovelStep(lx, ly, prevCur.X - wc.B.X, prevCur.Y - wc.B.Y, down, ref shovelLoad);
+                wc.ShovelAnimate(dt);
                 prevDown = down;
             }
             else if (tool == 2 && wc != null)
@@ -2880,15 +3045,31 @@ namespace Snowglobe
             {
                 if (e.Kind == 1 && robotWorld != null) robotWorld.Poke();
                 else if (e.Kind == 2) { SendRobot(e.Pt); SetTool(0); }
-                else if (e.Kind == 3) SetTool(0);
+                else if (e.Kind == 3)
+                {
+                    // Rechtsklick mit Schaufel: zurück an ihren Platz unten rechts am Hauptmonitor
+                    if (tool == 1) { shovelWorld = PrimaryWorld(); shovelWorld.ShovelHome(); }
+                    SetTool(0);
+                }
                 else if (e.Kind == 4)
                 {
                     prevCur = e.Pt;
+                    if (shovelWorld != null) shovelWorld.ShovelPickedUp();
                     SetTool(1, true);
                     if (!shovelTipShown)
                     {
                         shovelTipShown = true;
-                        tray.ShowBalloonTip(3000, "Schaufel in der Hand", "Ziehen schiebt Schnee, hochziehen und loslassen wirft ihn. Rechtsklick stellt die Schaufel zurück.", ToolTipIcon.None);
+                        tray.ShowBalloonTip(3000, "Schaufel in der Hand", "Ziehen schiebt Schnee, hochziehen und loslassen wirft ihn. Linksklick stellt die Schaufel dort ab, Rechtsklick bringt sie zurück an ihren Platz.", ToolTipIcon.None);
+                    }
+                }
+                else if (e.Kind == 5 && tool == 1)
+                {
+                    var w = WorldAt(e.Pt.X, e.Pt.Y);
+                    if (w != null)
+                    {
+                        SetTool(0);
+                        shovelWorld = w;
+                        w.PlantShovel(e.Pt.X - w.B.X, e.Pt.Y - w.B.Y);
                     }
                 }
             }
@@ -2978,13 +3159,21 @@ namespace Snowglobe
             UpdateHook();
         }
 
+        World PrimaryWorld()
+        {
+            var p = Screen.PrimaryScreen.Bounds;
+            foreach (var w in worlds) if (w.B == p) return w;
+            return worlds[0];
+        }
+
         void SetShovelShown(bool on)
         {
             shovelShown = on;
+            if (on && tool != 1) { shovelWorld = PrimaryWorld(); shovelWorld.ShovelHome(); }
             SaveSetting("Shovel", on ? 1 : 0);
             if (!on && tool == 1) SetTool(0);
             UpdateHook();
-            if (on) tray.ShowBalloonTip(3000, "Schaufel bereit", "Die Schaufel steht unten rechts am Hauptmonitor. Anklicken oder direkt ziehen – Rechtsklick stellt sie zurück.", ToolTipIcon.None);
+            if (on) tray.ShowBalloonTip(3000, "Schaufel bereit", "Die Schaufel steht unten rechts am Hauptmonitor. Linksklick nimmt sie in die Hand, ein weiterer Linksklick stellt sie dort ab.", ToolTipIcon.None);
         }
 
         // ---- Updates

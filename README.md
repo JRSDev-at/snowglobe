@@ -12,9 +12,11 @@ Leichter Schneefall direkt auf dem Windows-Desktop, mit Schaufel, Schneeroboter 
 
 ## Schaufel
 Tray-Menü → **Schaufel bereitstellen**: Unten rechts am Hauptmonitor steckt eine Schaufel im Schnee.
-- **Anklicken oder direkt ziehen**, und du hast sie in der Hand.
-- **Ziehen** schiebt Schnee wie ein Schneepflug. **Hochziehen** nimmt eine Ladung aufs Blatt, **Loslassen** wirft sie in Bewegungsrichtung ab, auch auf andere Fenster.
-- **Rechtsklick** stellt die Schaufel zurück. Solange du sie hältst, gehen Linksklicks nicht an andere Programme.
+- **Linksklick** (großzügige Klickfläche) nimmt sie in die Hand, mit etwas Schneegestöber. Direkt ziehen geht auch.
+- **Ziehen** mit gedrückter Taste schiebt Schnee wie ein Schneepflug. **Hochziehen** nimmt eine Ladung aufs Blatt, **Loslassen** wirft sie in Bewegungsrichtung ab, auch auf andere Fenster.
+- Die Schaufel bewegt sich mit: Sie schabt beim Schieben über den Boden, kippt beim Hochziehen nach hinten, schwingt beim Tragen nach und schnellt beim Wurf hoch.
+- **Kurzer Linksklick** (ohne Ziehen) sticht die Schaufel an dieser Stelle in den Schnee, auch auf ein Fenster. Verschwindet das Fenster, fällt sie auf die nächste Fläche darunter.
+- **Rechtsklick** bringt sie zurück an ihren Platz unten rechts. Solange du sie hältst, gehen Linksklicks nicht an andere Programme.
 
 ## Schneeroboter
 Ein kleiner Räumroboter. Seine Aufgabe: liegenden Schnee **an den Bildschirmrand zu großen Haufen schieben**. Am Boden schiebt er die linke Hälfte nach links und die rechte nach rechts, von Fenstern schiebt er den Schnee über die Kanten.
