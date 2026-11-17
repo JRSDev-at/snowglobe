@@ -92,4 +92,4 @@ Installierte Snowglobes prüfen eine Minute nach dem Start und danach alle 6 Stu
 - Klicks auf Roboter und Schaufel erkennt ein Low-Level-Maushook auf einem eigenen Thread. Er ist nur aktiv, solange Roboter oder Schaufel sichtbar sind, und lässt Mausbewegungen immer durch.
 
 ## Lizenz
-[MIT](LICENSE) © JRSDev-at
+Copyright © 2026 JRSDev-at. Snowglobe ist freie Software unter der [GNU General Public License v3.0](LICENSE) (oder einer späteren Version): Du darfst es nutzen, verändern und weitergeben. Veränderte Versionen müssen ebenfalls unter der GPL und mit Quellcode weitergegeben werden. Ohne jede Gewährleistung.

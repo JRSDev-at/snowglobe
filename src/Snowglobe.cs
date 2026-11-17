@@ -3,6 +3,23 @@
 // Fensteroberkanten, Desktop-Icons und am Bildschirmboden liegen. Dazu eine
 // Schaufel, ein Schneeroboter und automatische Updates über GitHub-Releases.
 // Build: build.cmd (nutzt den in Windows enthaltenen C#-Compiler, kein SDK nötig)
+//
+// Copyright (C) 2026 JRSDev-at
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+//
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 using System;
 using System.Collections.Concurrent;
@@ -24,6 +41,7 @@ using Microsoft.Win32;
 
 [assembly: AssemblyTitle("Snowglobe")]
 [assembly: AssemblyProduct("Snowglobe")]
+[assembly: AssemblyCopyright("Copyright (C) 2026 JRSDev-at, GPL-3.0-or-later")]
 [assembly: AssemblyVersion("1.3.1.0")]
 
 namespace Snowglobe
